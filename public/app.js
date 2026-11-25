@@ -1311,6 +1311,74 @@ async function loginWithPasskey() {
   });
 }
 
+// Depois de entrar com senha, convida a cadastrar uma passkey — a menos que a pessoa
+// já tenha uma para este endereço ou tenha dispensado o convite neste aparelho.
+async function offerPasskey() {
+  const dismissedKey = `passkey-dispensada-${me.id}`;
+  try {
+    if (!passkeysSupported() || localStorage.getItem(dismissedKey)) return;
+  } catch {
+    return;
+  }
+  const keys = await api('GET', '/passkeys').catch(() => null);
+  if (!keys || keys.some((k) => k.rp_id === location.hostname) || document.querySelector('dialog[open]')) return;
+
+  const err = el('p', { class: 'form-error', role: 'alert' });
+  const add = el(
+    'button',
+    {
+      class: 'btn primary',
+      type: 'button',
+      onclick: async () => {
+        err.textContent = '';
+        add.disabled = true;
+        try {
+          if (await registerPasskey()) {
+            toast('Passkey cadastrada. Da próxima vez, use "Entrar com passkey".');
+            dlg.close();
+            return;
+          }
+        } catch (e) {
+          err.textContent = e.message;
+        }
+        add.disabled = false;
+      },
+    },
+    'Cadastrar passkey'
+  );
+  const dlg = el(
+    'dialog',
+    { class: 'modal' },
+    el('h2', null, 'Entrar sem senha neste aparelho?'),
+    el('p', null, 'Cadastre uma passkey para entrar com a digital, o rosto ou o PIN do aparelho. Leva alguns segundos e a senha continua valendo.'),
+    err,
+    el(
+      'div',
+      { class: 'modal-actions' },
+      el('span', { class: 'spacer' }),
+      el(
+        'button',
+        {
+          class: 'btn',
+          type: 'button',
+          onclick: () => {
+            try {
+              localStorage.setItem(dismissedKey, '1');
+            } catch {}
+            dlg.close();
+          },
+        },
+        'Agora não'
+      ),
+      add
+    ),
+    el('p', { class: 'hint' }, 'Dá para cadastrar ou remover depois em "Conta".')
+  );
+  dlg.addEventListener('close', () => dlg.remove());
+  document.body.append(dlg);
+  dlg.showModal();
+}
+
 function accountDialog() {
   const list = el('ul', { class: 'passkey-list' });
   const err = el('p', { class: 'form-error', role: 'alert' });
@@ -1429,6 +1497,7 @@ function loginView() {
           try {
             me = await api('POST', '/login', { email: mail.value, password: pw.value });
             await refresh(true);
+            offerPasskey();
           } catch (ex) {
             err.textContent = ex.message;
             btn.disabled = false;
