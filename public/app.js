@@ -10,7 +10,7 @@ let me = null;
 let state = null;
 let stateJson = '';
 let people = null; // lista completa, só para admin
-let view = location.hash === '#referencias' ? 'refs' : 'tasks';
+let view = { '#referencias': 'refs', '#arquivos': 'files' }[location.hash] || 'tasks';
 const filter = { who: 'all', hideDone: false };
 let dragId = null;
 let focusCat = null;
@@ -1178,6 +1178,164 @@ function refsView() {
   );
 }
 
+// ---------- arquivos ----------
+
+const MAX_FILE_BYTES = 50 * 1024 * 1024;
+
+function fmtSize(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1).replace('.', ',')} MB`;
+}
+
+function uploadFile(folderId, file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `/api/folders/${folderId}/files`);
+    xhr.setRequestHeader('X-Requested-With', 'obsoleta');
+    xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.upload.onprogress = (e) => e.lengthComputable && onProgress(e.loaded / e.total);
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) return resolve();
+      let msg = 'Não foi possível enviar o arquivo.';
+      try {
+        msg = JSON.parse(xhr.responseText).error || msg;
+      } catch {}
+      reject(new Error(msg));
+    };
+    xhr.onerror = () => reject(new Error('O envio falhou. Verifique a conexão e tente de novo.'));
+    xhr.send(file);
+  });
+}
+
+async function sendFiles(folderId, list) {
+  const files = [...list];
+  if (!files.length) return;
+  dragId = -1; // segura a atualização automática da tela durante o envio
+  try {
+    let n = 0;
+    for (const f of files) {
+      n += 1;
+      if (f.size > MAX_FILE_BYTES) throw new Error(`"${f.name}" passa do limite de 50 MB.`);
+      if (!f.size) throw new Error(`"${f.name}" está vazio (ou é uma pasta — envie os arquivos de dentro dela).`);
+      const label = files.length > 1 ? `Enviando ${n} de ${files.length}` : 'Enviando';
+      toast(`${label}: ${f.name}…`);
+      await uploadFile(folderId, f, (frac) => toast(`${label}: ${f.name} (${Math.round(frac * 100)}%)`));
+    }
+    toast(n === 1 ? 'Arquivo enviado.' : `${n} arquivos enviados.`);
+  } catch (e) {
+    toast(e.message);
+  }
+  dragId = null;
+  await refresh(true);
+}
+
+function fileDialog(f) {
+  formDialog({
+    title: 'Editar arquivo',
+    fields: [
+      { name: 'name', label: 'Nome', value: f.name, required: true, hint: 'Mantenha a extensão (.pdf, .docx…) para o arquivo abrir corretamente.' },
+      { name: 'folder_id', label: 'Pasta', type: 'select', numeric: true, value: f.folder_id, options: state.folders.map((d) => [d.id, d.name]) },
+    ],
+    onSubmit: (v) => api('PATCH', `/files/${f.id}`, v),
+    onDelete: () => api('DELETE', `/files/${f.id}`),
+    deleteLabel: 'Excluir arquivo',
+  });
+}
+
+function folderDialog(folder) {
+  const n = state.folders.length + (folder ? 0 : 1);
+  formDialog({
+    title: folder ? 'Editar pasta' : 'Nova pasta',
+    fields: [
+      { name: 'name', label: 'Nome', value: folder && folder.name, required: true },
+      {
+        name: 'position',
+        label: 'Posição',
+        type: 'select',
+        numeric: true,
+        value: folder ? state.folders.indexOf(folder) : n - 1,
+        options: Array.from({ length: n }, (_, i) => [i, `${i + 1}ª`]),
+      },
+    ],
+    onSubmit: async (v) => {
+      if (folder) return api('PATCH', `/folders/${folder.id}`, v);
+      const { id } = await api('POST', '/folders', { name: v.name });
+      return api('PATCH', `/folders/${id}`, { position: v.position });
+    },
+    onDelete: folder ? () => api('DELETE', `/folders/${folder.id}`) : null,
+    deleteLabel: 'Excluir pasta',
+  });
+}
+
+function fileRow(f) {
+  const ext = f.name.includes('.') ? f.name.split('.').pop().slice(0, 4).toUpperCase() : '—';
+  const by = userById(f.uploaded_by);
+  return el(
+    'li',
+    { class: 'file' },
+    el('span', { class: 'ext', 'aria-hidden': 'true' }, ext),
+    el(
+      'div',
+      { class: 'file-main' },
+      el('a', { href: `/api/files/${f.id}`, target: '_blank', rel: 'noopener' }, f.name),
+      el('p', { class: 'hint' }, [fmtSize(f.size), fmtWhen(f.created_at).slice(0, 5), by && `por ${by.name}`].filter(Boolean).join(' · '))
+    ),
+    el('a', { class: 'icon', href: `/api/files/${f.id}?download`, title: 'Baixar', 'aria-label': `Baixar ${f.name}` }, '↓'),
+    el('button', { class: 'icon', type: 'button', title: 'Editar arquivo', 'aria-label': `Editar ${f.name}`, onclick: () => fileDialog(f) }, '⋯')
+  );
+}
+
+function filesView() {
+  return el(
+    'main',
+    { class: 'refs files' },
+    el('div', { class: 'toolbar' }, el('button', { class: 'btn', type: 'button', onclick: () => folderDialog(null) }, '+ Nova pasta')),
+    state.folders.length === 0 &&
+      el('p', { class: 'hint empty' }, 'Nenhuma pasta ainda. Crie pastas para guardar contratos, documentos dos sócios e outros arquivos da livraria.'),
+    el(
+      'div',
+      { class: 'themes' },
+      state.folders.map((d) => {
+        const files = state.files.filter((f) => f.folder_id === d.id);
+        const picker = el('input', { type: 'file', multiple: true, hidden: true, onchange: () => sendFiles(d.id, picker.files) });
+        return el(
+          'section',
+          {
+            class: 'theme',
+            ondragover: (e) => {
+              if (!hasFiles(e)) return;
+              e.preventDefault();
+              e.currentTarget.classList.add('drop-here');
+            },
+            ondragleave: (e) => {
+              if (!e.currentTarget.contains(e.relatedTarget)) e.currentTarget.classList.remove('drop-here');
+            },
+            ondrop: (e) => {
+              if (!hasFiles(e)) return;
+              e.preventDefault();
+              e.currentTarget.classList.remove('drop-here');
+              sendFiles(d.id, e.dataTransfer.files);
+            },
+          },
+          el(
+            'header',
+            null,
+            el('h2', null, d.name),
+            el('span', { class: 'count' }, String(files.length)),
+            el('button', { class: 'icon', type: 'button', title: 'Editar pasta', 'aria-label': `Editar pasta ${d.name}`, onclick: () => folderDialog(d) }, '⋯')
+          ),
+          el('ul', null, files.map(fileRow)),
+          picker,
+          el('button', { class: 'btn quiet', type: 'button', onclick: () => picker.click() }, '+ Enviar arquivo')
+        );
+      })
+    ),
+    state.folders.length > 0 && el('p', { class: 'hint empty' }, 'No computador, arraste arquivos para cima de uma pasta. Limite de 50 MB por arquivo.')
+  );
+}
+
 // ---------- pessoas ----------
 
 function personDialog(u) {
@@ -1227,6 +1385,13 @@ function peopleView() {
           el('button', { class: 'btn quiet', type: 'button', onclick: () => personDialog(u) }, 'Editar')
         )
       )
+    ),
+    el(
+      'div',
+      { class: 'backup' },
+      el('h2', null, 'Backup'),
+      el('p', { class: 'hint' }, 'Baixa um arquivo com tudo: tarefas, referências, comentários, contas, imagens e arquivos. Guarde fora do servidor, em lugar seguro — ele contém os documentos dos sócios.'),
+      el('a', { class: 'btn', href: '/api/backup' }, 'Baixar backup agora')
     ),
     el('p', { class: 'hint' }, 'Não há cadastro público: só quem está nesta lista, com acesso ativo, consegue entrar. Desativar alguém encerra as sessões dessa pessoa na hora.')
   );
@@ -1571,7 +1736,7 @@ function render() {
       'header',
       { class: 'top' },
       el('span', { class: 'brand' }, 'Obsoleta'),
-      el('nav', null, tab('tasks', 'Tarefas', '#tarefas'), tab('refs', 'Referências', '#referencias'), me.is_admin && tab('people', 'Pessoas', '#pessoas')),
+      el('nav', null, tab('tasks', 'Tarefas', '#tarefas'), tab('refs', 'Referências', '#referencias'), tab('files', 'Arquivos', '#arquivos'), me.is_admin && tab('people', 'Pessoas', '#pessoas')),
       el('span', { class: 'spacer' }),
       el(
         'button',
@@ -1596,7 +1761,7 @@ function render() {
         'Sair'
       )
     ),
-    view === 'refs' ? refsView() : view === 'people' ? peopleView() : tasksView()
+    view === 'refs' ? refsView() : view === 'files' ? filesView() : view === 'people' ? peopleView() : tasksView()
   );
 
   const board = root.querySelector('.board');

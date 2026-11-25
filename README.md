@@ -4,6 +4,7 @@ Quadro de tarefas e área de referências dos sócios da livraria.
 
 - **Tarefas**: colunas são categorias; cada tarefa tem situação (a fazer / em andamento / concluída), prazo e um ou mais responsáveis. Arraste os cartões entre colunas (no celular, troque a categoria ao editar a tarefa).
 - **Referências**: links, anotações e imagens agrupados por tema. Links ganham uma prévia (título, descrição e imagem da página); publicações públicas do Instagram podem ser abertas ali mesmo. Ao ampliar uma imagem dá para reagir com emojis e navegar entre as imagens da referência. Imagens são anexadas pelo botão "+ Imagem", pelo formulário ou arrastando arquivos sobre a referência.
+- **Arquivos**: repositório de documentos (contratos, documentos dos sócios) organizado em pastas. Até 50 MB por arquivo; envio pelo botão ou arrastando para a pasta. PDFs, imagens e `.txt` abrem no navegador, o resto é baixado. Só quem está logado acessa.
 - **Comentários**: clicar numa tarefa abre a janela de leitura com a descrição e a conversa; o botão "Editar" fica no canto superior direito. Referências têm a mesma conversa. Digitar `@` sugere pessoas; quem é marcado vê um aviso "@ menções" no topo ao abrir o sistema (não há envio de e-mail).
 - **Pessoas**: não existe cadastro público. Só um admin cria, edita e desativa contas.
 
@@ -50,13 +51,20 @@ Rode **uma única instância**: SQLite em arquivo e o limitador de tentativas de
 
 ## Backup
 
-São duas coisas, ambas em `DATA_DIR`: o banco `obsoleta.db` e a pasta `uploads/` com as imagens anexadas. Um sem o outro fica incompleto. Para copiar o banco com o app no ar:
+Tudo fica em `DATA_DIR`: o banco `obsoleta.db`, as imagens das referências em `uploads/` e os documentos da aba Arquivos em `files/`. Não há backup automático dentro do app. São duas camadas, e vale ter as duas:
+
+1. **No host**: agende snapshots do volume (no Railway, aba *Backups* do serviço). Cobre falha de disco e exclusão acidental, mas fica na mesma conta do host.
+2. **Fora do host**: um admin baixa tudo em **Pessoas → Baixar backup agora**. O arquivo `.tar.gz` traz uma cópia consistente do banco (sem as sessões abertas) e todos os arquivos. Guarde em lugar seguro: ele contém os documentos e os hashes de senha.
+
+### Restaurar
+
+Com o app parado, extraia o backup dentro de `DATA_DIR` (substituindo `obsoleta.db`, `uploads/` e `files/`) e inicie de novo:
 
 ```bash
-sqlite3 /data/obsoleta.db ".backup '/data/backup.db'"
+tar -xzf obsoleta-backup-AAAA-MM-DD-HH-MM.tar.gz -C /data
 ```
 
-Não há backup automático. O snapshot do volume do host cobre banco e imagens de uma vez; é a opção mais simples.
+Todos precisam entrar de novo, com a senha ou passkey que tinham no momento do backup.
 
 ## Testes
 

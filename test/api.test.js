@@ -56,6 +56,7 @@ before(async () => {
   const app = createApp({
     dbPath: ':memory:',
     uploadDir,
+    filesDir: `${uploadDir}-arquivos`,
     previewAllowPrivate: true,
     admin: { name: 'Ana', email: 'ana@example.com', password: 'senha-da-ana-123' },
   });
@@ -68,6 +69,7 @@ after(() => {
   server.close();
   site.close();
   fs.rmSync(uploadDir, { recursive: true, force: true });
+  fs.rmSync(`${uploadDir}-arquivos`, { recursive: true, force: true });
 });
 
 test('exige login e o cabeçalho anti-CSRF', async () => {
@@ -259,4 +261,61 @@ test('passkeys: desafio é emitido e respostas inválidas são recusadas', async
   const other = await anon('POST', '/passkeys/login/options', {});
   assert.equal((await ana('POST', '/passkeys/register/verify', { flow: other.body.flow, response: fake })).status, 400);
   assert.deepEqual((await ana('GET', '/passkeys')).body, []);
+});
+
+test('arquivos: envio, download seguro, mover, excluir e backup', async () => {
+  const cookie = await login();
+  const call = (method, url, body, headers = {}) =>
+    fetch(base + url, {
+      method,
+      headers: { 'X-Requested-With': 'obsoleta', cookie, ...(body && !headers['X-File-Name'] ? { 'Content-Type': 'application/json' } : {}), ...headers },
+      body: body && !headers['X-File-Name'] ? JSON.stringify(body) : body,
+    });
+  const f1 = (await (await call('POST', '/folders', { name: 'Contratos' })).json()).id;
+  const f2 = (await (await call('POST', '/folders', { name: 'Sócios' })).json()).id;
+
+  const up = (name, body) => call('POST', `/folders/${f1}/files`, body, { 'X-File-Name': encodeURIComponent(name) });
+  assert.equal((await up('vazio.txt', Buffer.alloc(0))).status, 400);
+  assert.equal((await call('POST', `/folders/${f1}/files`, Buffer.from('x'), { 'X-File-Name': '%E0%A4%A' })).status, 400);
+  const pdf = (await (await up('Contrato de aluguel – loja.pdf', Buffer.from('%PDF-1.4 teste'))).json()).id;
+  const html = (await (await up('../../pagina.html', Buffer.from('<script>alert(1)</script>'))).json()).id;
+
+  let s = await (await call('GET', '/state')).json();
+  assert.deepEqual(s.files.map((f) => f.name).sort(), ['....pagina.html', 'Contrato de aluguel – loja.pdf']);
+
+  // PDF abre no navegador; HTML nunca é servido como página
+  const a = await call('GET', `/files/${pdf}`);
+  assert.equal(a.headers.get('content-type'), 'application/pdf');
+  assert.match(a.headers.get('content-disposition'), /^inline; .*filename\*=UTF-8''Contrato%20de%20aluguel/);
+  assert.equal(await a.text(), '%PDF-1.4 teste');
+  assert.match((await call('GET', `/files/${pdf}?download`)).headers.get('content-disposition'), /^attachment/);
+  const h = await call('GET', `/files/${html}`);
+  assert.equal(h.headers.get('content-type'), 'application/octet-stream');
+  assert.match(h.headers.get('content-disposition'), /^attachment/);
+  assert.equal((await fetch(`${base}/files/${pdf}`)).status, 401);
+
+  // renomear e mover; pasta com arquivos não é excluída
+  assert.equal((await call('PATCH', `/files/${pdf}`, { name: 'Aluguel.pdf', folder_id: f2 })).status, 200);
+  s = await (await call('GET', '/state')).json();
+  assert.deepEqual(s.files.find((f) => f.id === pdf), { ...s.files.find((f) => f.id === pdf), name: 'Aluguel.pdf', folder_id: f2 });
+  assert.equal((await call('DELETE', `/folders/${f2}`)).status, 409);
+
+  // backup: gzip com o banco e os arquivos
+  const bk = await call('GET', '/backup');
+  assert.equal(bk.status, 200);
+  const tar = require('node:zlib').gunzipSync(Buffer.from(await bk.arrayBuffer()));
+  const names = [];
+  for (let off = 0; off + 512 <= tar.length; ) {
+    const name = tar.toString('utf8', off, off + 100).replace(/\0.*$/, '');
+    if (!name) break;
+    const size = parseInt(tar.toString('ascii', off + 124, off + 135), 8);
+    names.push(name);
+    off += 512 + Math.ceil(size / 512) * 512;
+  }
+  assert.equal(names[0], 'obsoleta.db');
+  assert.equal(names.filter((n) => n.startsWith('files/')).length, 2);
+  assert.equal(tar.toString('latin1', 512, 528), 'SQLite format 3\0');
+
+  assert.equal((await call('DELETE', `/files/${html}`)).status, 200);
+  assert.equal((await call('GET', `/files/${html}`)).status, 404);
 });

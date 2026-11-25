@@ -4,6 +4,9 @@ const express = require('express');
 const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
+const zlib = require('node:zlib');
+const { Readable, Transform } = require('node:stream');
+const { pipeline } = require('node:stream/promises');
 const { DatabaseSync } = require('node:sqlite');
 const { fetchPreview } = require('./preview');
 const {
@@ -18,6 +21,18 @@ const MIN_PASSWORD = 10;
 const STATUSES = ['todo', 'doing', 'done'];
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_IMAGES_PER_REF = 30;
+const MAX_FILE_BYTES = 50 * 1024 * 1024;
+// Só estes tipos abrem no navegador; o resto é sempre baixado, para que um arquivo
+// enviado (HTML, SVG...) nunca rode como página do próprio sistema.
+const INLINE_TYPES = {
+  pdf: 'application/pdf',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  webp: 'image/webp',
+  gif: 'image/gif',
+  txt: 'text/plain; charset=utf-8',
+};
 const REACTIONS = ['👍', '❤️', '😂', '😮', '🤔', '👎'];
 const COLORS = ['vinho', 'ambar', 'oliva', 'petroleo', 'azul', 'ameixa', 'grafite'];
 
@@ -113,11 +128,43 @@ function imageType(buf) {
   return null;
 }
 
+function fileName(v) {
+  let s;
+  try {
+    s = decodeURIComponent(typeof v === 'string' ? v : '');
+  } catch {
+    s = '';
+  }
+  s = s.replace(/[\u0000-\u001f\u007f/\\]/g, '').trim();
+  if (!s || s.length > 200) bad('Nome de arquivo inválido (máximo de 200 caracteres).');
+  return s;
+}
+
+// Cabeçalho de uma entrada de arquivo .tar (formato ustar), para o backup.
+function tarHeader(name, size, mtimeMs) {
+  const b = Buffer.alloc(512);
+  b.write(name, 0, 100);
+  b.write('0000600\0', 100);
+  b.write('0000000\0', 108);
+  b.write('0000000\0', 116);
+  b.write(`${size.toString(8).padStart(11, '0')}\0`, 124);
+  b.write(`${Math.floor(mtimeMs / 1000).toString(8).padStart(11, '0')}\0`, 136);
+  b.write('        ', 148);
+  b.write('0', 156);
+  b.write('ustar\0', 257);
+  b.write('00', 263);
+  let sum = 0;
+  for (const byte of b) sum += byte;
+  b.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148);
+  return b;
+}
+
 // ---------- app ----------
 
-function createApp({ dbPath, uploadDir, production = false, admin, previewAllowPrivate = false, appOrigin } = {}) {
-  if (!uploadDir) throw new Error('uploadDir é obrigatório.');
+function createApp({ dbPath, uploadDir, filesDir, production = false, admin, previewAllowPrivate = false, appOrigin } = {}) {
+  if (!uploadDir || !filesDir) throw new Error('uploadDir e filesDir são obrigatórios.');
   fs.mkdirSync(uploadDir, { recursive: true });
+  fs.mkdirSync(filesDir, { recursive: true });
   const db = new DatabaseSync(dbPath);
   db.exec(`
     PRAGMA journal_mode = WAL;
@@ -191,6 +238,20 @@ function createApp({ dbPath, uploadDir, production = false, admin, previewAllowP
       target_id INTEGER NOT NULL,
       user_id INTEGER NOT NULL REFERENCES users(id),
       body TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS folders (
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      position INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS files (
+      id INTEGER PRIMARY KEY,
+      folder_id INTEGER NOT NULL REFERENCES folders(id),
+      name TEXT NOT NULL,
+      filename TEXT NOT NULL UNIQUE,
+      size INTEGER NOT NULL,
+      uploaded_by INTEGER REFERENCES users(id),
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE TABLE IF NOT EXISTS passkeys (
@@ -542,6 +603,8 @@ function createApp({ dbPath, uploadDir, production = false, admin, previewAllowP
         .all()
         .map((t) => ({ ...t, assignees: assignees.get(t.id) || [], comments: counts.get(`task:${t.id}`) || 0 })),
       themes: q('SELECT id, name FROM themes ORDER BY position, id').all(),
+      folders: q('SELECT id, name FROM folders ORDER BY position, id').all(),
+      files: q('SELECT id, folder_id, name, size, uploaded_by, created_at FROM files ORDER BY name COLLATE NOCASE').all(),
       refs: q(
         `SELECT id, theme_id, title, url, note, created_by, preview_title, preview_desc, preview_image, preview_site
          FROM refs ORDER BY title COLLATE NOCASE`
@@ -605,6 +668,7 @@ function createApp({ dbPath, uploadDir, production = false, admin, previewAllowP
     }
   });
   orderedList('/themes', 'themes', 'refs', 'theme_id', 'Tema');
+  orderedList('/folders', 'folders', 'files', 'folder_id', 'Pasta');
 
   // ---------- tarefas ----------
 
@@ -809,6 +873,129 @@ function createApp({ dbPath, uploadDir, production = false, admin, previewAllowP
     res.json({ ok: true });
   });
 
+  // ---------- arquivos ----------
+
+  const folderId = (v) => {
+    const id = intId(v, 'Pasta');
+    if (!q('SELECT id FROM folders WHERE id = ?').get(id)) bad('Pasta inexistente.');
+    return id;
+  };
+
+  // O corpo da requisição é o próprio arquivo, gravado direto em disco (sem passar pela memória).
+  api.post('/folders/:id/files', async (req, res) => {
+    const folder = folderId(req.params.id);
+    const name = fileName(req.get('X-File-Name'));
+    const tooBig = () => new HttpError(413, 'Arquivo grande demais (máximo de 50 MB).');
+    if (Number(req.get('Content-Length')) > MAX_FILE_BYTES) throw tooBig();
+    const stored = crypto.randomBytes(16).toString('hex');
+    const full = path.join(filesDir, stored);
+    let size = 0;
+    const limiter = new Transform({
+      transform(chunk, enc, cb) {
+        size += chunk.length;
+        cb(size > MAX_FILE_BYTES ? tooBig() : null, chunk);
+      },
+    });
+    try {
+      await pipeline(req, limiter, fs.createWriteStream(full, { flags: 'wx' }));
+      if (!size) bad('Arquivo vazio.');
+    } catch (e) {
+      fs.rm(full, { force: true }, () => {});
+      throw e.status ? e : new HttpError(400, 'O envio foi interrompido. Tente de novo.');
+    }
+    const r = q('INSERT INTO files (folder_id, name, filename, size, uploaded_by) VALUES (?, ?, ?, ?, ?)').run(folder, name, stored, size, req.user.id);
+    res.status(201).json({ id: Number(r.lastInsertRowid) });
+  });
+
+  api.get('/files/:id', (req, res) => {
+    const f = q('SELECT name, filename FROM files WHERE id = ?').get(intId(req.params.id));
+    if (!f) throw new HttpError(404, 'Arquivo não encontrado.');
+    const ext = f.name.includes('.') ? f.name.split('.').pop().toLowerCase() : '';
+    const inline = Object.hasOwn(INLINE_TYPES, ext) && req.query.download === undefined;
+    const ascii = f.name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+    res.sendFile(
+      f.filename,
+      {
+        root: filesDir,
+        headers: {
+          'Content-Type': inline ? INLINE_TYPES[ext] : 'application/octet-stream',
+          'Content-Disposition': `${inline ? 'inline' : 'attachment'}; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(f.name)}`,
+          'Cache-Control': 'private, no-cache',
+        },
+      },
+      (err) => {
+        if (err && !res.headersSent) res.status(404).json({ error: 'Arquivo não encontrado.' });
+      }
+    );
+  });
+
+  api.patch('/files/:id', (req, res) => {
+    const id = intId(req.params.id);
+    const f = q('SELECT * FROM files WHERE id = ?').get(id);
+    if (!f) throw new HttpError(404, 'Arquivo não encontrado.');
+    q('UPDATE files SET name = ?, folder_id = ? WHERE id = ?').run(
+      'name' in req.body ? fileName(encodeURIComponent(text(req.body.name, 'Nome', 200, true))) : f.name,
+      'folder_id' in req.body ? folderId(req.body.folder_id) : f.folder_id,
+      id
+    );
+    res.json({ ok: true });
+  });
+
+  api.delete('/files/:id', (req, res) => {
+    const id = intId(req.params.id);
+    const f = q('SELECT filename FROM files WHERE id = ?').get(id);
+    if (f) {
+      q('DELETE FROM files WHERE id = ?').run(id);
+      fs.rm(path.join(filesDir, f.filename), { force: true }, () => {});
+    }
+    res.json({ ok: true });
+  });
+
+  // ---------- backup (admin) ----------
+
+  // Um .tar.gz com uma cópia consistente do banco e todos os arquivos enviados.
+  // Para restaurar: extrair o conteúdo dentro de DATA_DIR com o app parado.
+  api.get('/backup', adminOnly, async (req, res) => {
+    const snapshot = path.join(filesDir, `.backup-${crypto.randomBytes(8).toString('hex')}.db`);
+    db.exec(`VACUUM INTO '${snapshot.replace(/'/g, "''")}'`);
+    try {
+      // Sessões abertas não vão para o backup: quem tiver o arquivo não entra como ninguém.
+      const copy = new DatabaseSync(snapshot);
+      copy.exec('DELETE FROM sessions; VACUUM;');
+      copy.close();
+      const entries = [['obsoleta.db', snapshot]];
+      for (const [prefix, dir] of [['uploads', uploadDir], ['files', filesDir]]) {
+        for (const name of fs.readdirSync(dir)) {
+          if (/^[a-f0-9]{32}$/.test(name)) entries.push([`${prefix}/${name}`, path.join(dir, name)]);
+        }
+      }
+      async function* tar() {
+        for (const [name, file] of entries) {
+          let stat;
+          try {
+            stat = fs.statSync(file);
+          } catch {
+            continue; // excluído enquanto o backup rodava
+          }
+          yield tarHeader(name, stat.size, stat.mtimeMs);
+          let sent = 0;
+          for await (const chunk of fs.createReadStream(file, { end: Math.max(stat.size - 1, 0) })) {
+            if (stat.size === 0) break;
+            sent += chunk.length;
+            yield chunk;
+          }
+          if (sent % 512) yield Buffer.alloc(512 - (sent % 512));
+        }
+        yield Buffer.alloc(1024);
+      }
+      const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
+      res.set({ 'Content-Type': 'application/gzip', 'Content-Disposition': `attachment; filename="obsoleta-backup-${stamp}.tar.gz"` });
+      await pipeline(Readable.from(tar()), zlib.createGzip(), res);
+    } finally {
+      fs.rm(snapshot, { force: true }, () => {});
+    }
+  });
+
   // ---------- comentários ----------
 
   const TARGETS = { task: 'tasks', ref: 'refs' };
@@ -959,6 +1146,7 @@ if (require.main === module) {
   const app = createApp({
     dbPath: path.join(dataDir, 'obsoleta.db'),
     uploadDir: path.join(dataDir, 'uploads'),
+    filesDir: path.join(dataDir, 'files'),
     production: process.env.NODE_ENV === 'production',
     appOrigin: process.env.APP_ORIGIN || undefined,
     admin: {
