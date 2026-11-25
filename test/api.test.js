@@ -406,3 +406,38 @@ test('dependências entre tarefas: sem ciclos, e concluir avisa o que liberou', 
   await ana('DELETE', `/tasks/${cnpj}`);
   assert.deepEqual((await ana('GET', '/state')).body.tasks.find((t) => t.id === conta).depends_on, []);
 });
+
+test('atualização ao vivo: avisa quem está conectado quando algo muda', async () => {
+  const ana = client();
+  await ana('POST', '/login', { email: 'ana@example.com', password: cookieOf.password });
+  assert.equal((await fetch(`${base}/events`)).status, 401);
+  const ac = new AbortController();
+  const res = await fetch(`${base}/events`, { headers: { cookie: ana.cookie() }, signal: ac.signal });
+  assert.match(res.headers.get('content-type'), /text\/event-stream/);
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  const until = async (re) => {
+    while (!re.test(buf)) buf += dec.decode((await reader.read()).value);
+  };
+  await until(/event: hello\ndata: [a-f0-9]{12}\n\n/);
+  await ana('GET', '/state'); // leitura não avisa
+  await ana('POST', '/categories', { name: 'Ao vivo' });
+  await until(/event: change/);
+  assert.equal(buf.match(/event: change/g).length, 1);
+  ac.abort();
+});
+
+test('busca em comentários ignora acentos e exige todos os termos', async () => {
+  const ana = client();
+  await ana('POST', '/login', { email: 'ana@example.com', password: cookieOf.password });
+  const cat = (await ana('POST', '/categories', { name: 'Busca' })).body.id;
+  const task = (await ana('POST', '/tasks', { category_id: cat, title: 'Alvará' })).body.id;
+  await ana('POST', '/comments', { kind: 'task', id: task, body: 'A prefeitura pediu a certidão de ocupação do imóvel' });
+  const find = async (text) => (await ana('GET', `/search?q=${encodeURIComponent(text)}`)).body;
+  assert.equal((await find('CERTIDAO ocupacao')).length, 1);
+  assert.equal((await find('certidão'))[0].target_id, task);
+  assert.equal((await find('certidão bombeiros')).length, 0);
+  assert.deepEqual(await find('   '), []);
+  assert.equal((await fetch(`${base}/search?q=x`)).status, 401);
+});

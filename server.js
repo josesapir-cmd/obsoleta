@@ -383,7 +383,29 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
     next();
   });
 
-  app.use(express.static(path.join(__dirname, 'public'), { maxAge: production ? '5m' : 0 }));
+  // Sempre revalida (ETag): depois de um deploy, ninguém fica preso a uma versão antiga da tela.
+  app.use(express.static(path.join(__dirname, 'public'), { cacheControl: false, setHeaders: (res) => res.set('Cache-Control', 'no-cache') }));
+
+  // Identifica a versão da interface; muda a cada deploy que altere a pasta public.
+  const publicDir = path.join(__dirname, 'public');
+  const uiVersion = fs
+    .readdirSync(publicDir)
+    .sort()
+    .reduce((h, f) => h.update(f).update(fs.readFileSync(path.join(publicDir, f))), crypto.createHash('sha256'))
+    .digest('hex')
+    .slice(0, 12);
+
+  // Atualização ao vivo: cada navegador mantém uma conexão aberta (/api/events) e é avisado
+  // quando qualquer pessoa altera algo, para buscar os dados novos na hora.
+  const liveClients = new Set();
+  let liveTimer = null;
+  function broadcast() {
+    if (liveTimer) return;
+    liveTimer = setTimeout(() => {
+      liveTimer = null;
+      for (const client of liveClients) client.write('event: change\ndata: 1\n\n');
+    }, 150);
+  }
 
   const api = express.Router();
   app.use('/api', api);
@@ -393,6 +415,11 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
     // Cabeçalho próprio: um site de terceiros não consegue enviá-lo sem CORS (proteção CSRF).
     if (req.method !== 'GET' && req.get('X-Requested-With') !== 'obsoleta') {
       throw new HttpError(403, 'Requisição recusada.');
+    }
+    if (req.method !== 'GET') {
+      res.on('finish', () => {
+        if (res.statusCode < 400) broadcast();
+      });
     }
     next();
   });
@@ -549,6 +576,20 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
   };
 
   api.get('/me', (req, res) => res.json(publicUser(req.user)));
+
+  api.get('/events', (req, res) => {
+    if (liveClients.size >= 100) throw new HttpError(503, 'Muitas conexões abertas.');
+    res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', 'X-Accel-Buffering': 'no' });
+    res.flushHeaders();
+    res.write(`retry: 3000\nevent: hello\ndata: ${uiVersion}\n\n`);
+    liveClients.add(res);
+    // Mantém a conexão viva através de proxies que derrubam conexões paradas.
+    const ping = setInterval(() => res.write(': ping\n\n'), 25000);
+    req.on('close', () => {
+      clearInterval(ping);
+      liveClients.delete(res);
+    });
+  });
 
   api.post('/me/password', (req, res) => {
     const fail = throttle(`pw|${req.user.id}`);
@@ -1150,6 +1191,25 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
     } finally {
       fs.rm(snapshot, { force: true }, () => {});
     }
+  });
+
+  // ---------- busca ----------
+
+  // A tela busca sozinha em tarefas, referências e arquivos (que já estão carregados);
+  // aqui ficam só os comentários. Ignora acentos e maiúsculas; todos os termos precisam aparecer.
+  const fold = (v) => v.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  api.get('/search', (req, res) => {
+    const terms = fold(typeof req.query.q === 'string' ? req.query.q.slice(0, 100) : '').split(/\s+/).filter(Boolean);
+    if (!terms.length) return res.json([]);
+    const out = [];
+    for (const c of q('SELECT id, kind, target_id, user_id, body, created_at FROM comments ORDER BY id DESC').iterate()) {
+      const hay = fold(c.body);
+      if (!terms.every((t) => hay.includes(t))) continue;
+      const at = Math.max(0, hay.indexOf(terms[0]) - 40);
+      out.push({ ...c, body: (at ? '…' : '') + c.body.slice(at, at + 160) + (c.body.length > at + 160 ? '…' : '') });
+      if (out.length >= 20) break;
+    }
+    res.json(out);
   });
 
   // ---------- comentários ----------

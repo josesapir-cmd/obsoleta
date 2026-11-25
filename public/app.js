@@ -32,6 +32,21 @@ function el(tag, attrs, ...kids) {
   return n;
 }
 
+// Ícone de traço fino (SVG), desenhado a partir de um ou mais caminhos numa grade 24×24.
+function lineIcon(...paths) {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  for (const [k, v] of Object.entries({ viewBox: '0 0 24 24', width: 20, height: 20, fill: 'none', stroke: 'currentColor', 'stroke-width': 1.5, 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true' })) {
+    svg.setAttribute(k, v);
+  }
+  for (const d of paths) {
+    const path = document.createElementNS(ns, 'path');
+    path.setAttribute('d', d);
+    svg.append(path);
+  }
+  return svg;
+}
+
 async function api(method, url, body) {
   const res = await fetch(`/api${url}`, {
     method,
@@ -663,8 +678,11 @@ function itemDialog({ kind, id, title, details, onEdit, actions }) {
     )
   );
   const timer = setInterval(load, 20000);
+  const liveLoad = () => load(true);
+  liveListeners.add(liveLoad);
   dlg.addEventListener('close', () => {
     clearInterval(timer);
+    liveListeners.delete(liveLoad);
     dlg.remove();
     refresh(true);
   });
@@ -818,6 +836,132 @@ function mentionsDialog() {
   dlg.showModal();
 }
 
+// ---------- busca (Ctrl+K) ----------
+
+const fold = (v) => (v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+
+function searchLocal(query) {
+  const terms = fold(query).split(/\s+/).filter(Boolean);
+  if (!terms.length) return [];
+  const has = (...fields) => {
+    const hay = fold(fields.filter(Boolean).join('\n'));
+    return terms.every((t) => hay.includes(t));
+  };
+  const name = (list, id) => (list.find((x) => x.id === id) || {}).name || '';
+  const out = [];
+  for (const t of state.tasks) {
+    const cat = name(state.categories, t.category_id);
+    const people = t.assignees.map((id) => (userById(id) || {}).name);
+    const inTitle = has(t.title);
+    if (!inTitle && !has(t.title, t.description, cat, ...people)) continue;
+    out.push({ type: 'Tarefa', title: t.title, sub: [cat, STATUS[t.status], people.join(', ')].filter(Boolean).join(' · '), rank: inTitle ? 0 : 1, open: () => taskView(t) });
+  }
+  for (const r of state.refs) {
+    const theme = name(state.themes, r.theme_id);
+    const inTitle = has(r.title);
+    if (!inTitle && !has(r.title, r.note, r.url, r.preview_title, r.preview_desc, theme)) continue;
+    out.push({ type: 'Referência', title: r.title, sub: [theme, r.note.slice(0, 80)].filter(Boolean).join(' · '), rank: inTitle ? 0 : 1, open: () => refView(r) });
+  }
+  for (const f of state.files) {
+    const folder = name(state.folders, f.folder_id);
+    const inTitle = has(f.name);
+    if (!inTitle && !has(f.name, folder)) continue;
+    out.push({ type: 'Arquivo', title: f.name, sub: `${folder} · ${fmtSize(f.size)}`, rank: inTitle ? 0 : 1, open: () => window.open(`/api/files/${f.id}`, '_blank', 'noopener') });
+  }
+  return out.sort((a, b) => a.rank - b.rank).slice(0, 30);
+}
+
+function spotlight() {
+  if (!me || !state || document.querySelector('dialog.spotlight')) return;
+  let results = [];
+  let idx = 0;
+  let seq = 0;
+  let timer;
+  const list = el('ul', { class: 'spot-results', role: 'listbox', id: 'spot-results' });
+  const status = el('p', { class: 'hint spot-status' }, 'Busca em tarefas, referências, arquivos e comentários.');
+  const input = el('input', {
+    type: 'search',
+    placeholder: 'Buscar…',
+    'aria-label': 'Buscar',
+    'aria-controls': 'spot-results',
+    autocomplete: 'off',
+    spellcheck: false,
+  });
+  const choose = (r) => {
+    dlg.close();
+    r.open();
+  };
+  const draw = () => {
+    list.replaceChildren(
+      ...results.map((r, i) =>
+        el(
+          'li',
+          { role: 'option', 'aria-selected': String(i === idx), class: i === idx ? 'on' : '', onclick: () => choose(r), onmousemove: () => { if (idx !== i) { idx = i; draw(); } } },
+          el('span', { class: 'spot-type' }, r.type),
+          el('span', { class: 'spot-main' }, el('strong', null, r.title), r.sub && el('span', { class: 'hint' }, r.sub))
+        )
+      )
+    );
+    const on = list.querySelector('.on');
+    if (on) on.scrollIntoView({ block: 'nearest' });
+    status.hidden = results.length > 0;
+    if (!results.length) status.textContent = input.value.trim() ? 'Nada encontrado.' : 'Busca em tarefas, referências, arquivos e comentários.';
+  };
+  const run = () => {
+    const query = input.value;
+    const local = searchLocal(query);
+    results = local;
+    idx = 0;
+    draw();
+    clearTimeout(timer);
+    const mine = ++seq;
+    if (query.trim().length < 2) return;
+    timer = setTimeout(async () => {
+      const comments = await api('GET', `/search?q=${encodeURIComponent(query)}`).catch(() => []);
+      if (mine !== seq) return; // a pessoa já digitou outra coisa
+      const extra = comments
+        .map((c) => {
+          const item = (c.kind === 'task' ? state.tasks : state.refs).find((x) => x.id === c.target_id);
+          const u = userById(c.user_id);
+          return item && { type: 'Comentário', title: c.body, sub: `${u ? u.name : 'Alguém'} em “${item.title}”`, open: () => (c.kind === 'task' ? taskView(item) : refView(item)) };
+        })
+        .filter(Boolean);
+      results = [...local, ...extra];
+      draw();
+    }, 200);
+  };
+  input.addEventListener('input', run);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      if (results.length) idx = (idx + (e.key === 'ArrowDown' ? 1 : results.length - 1)) % results.length;
+      draw();
+    } else if (e.key === 'Enter') {
+      if (results[idx]) choose(results[idx]);
+    } else {
+      return;
+    }
+    e.preventDefault();
+  });
+  const dlg = el('dialog', { class: 'modal spotlight' }, el('div', { class: 'spot-input' }, lineIcon('M11 4a7 7 0 1 0 0 14a7 7 0 0 0 0-14z', 'M20 20l-4-4'), input), status, list);
+  dlg.addEventListener('close', () => {
+    clearTimeout(timer);
+    seq += 1;
+    dlg.remove();
+  });
+  document.body.append(dlg);
+  dlg.showModal();
+  input.focus();
+}
+
+document.addEventListener('keydown', (e) => {
+  const typing = /^(INPUT|TEXTAREA|SELECT)$/.test((document.activeElement || {}).tagName || '');
+  const shortcut = ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') || (e.key === '/' && !typing);
+  if (!shortcut || e.altKey) return;
+  if (document.querySelector('dialog[open]')) return;
+  e.preventDefault();
+  spotlight();
+});
+
 // ---------- novidades (sininho) ----------
 
 function openActivityTarget(a) {
@@ -920,13 +1064,63 @@ async function activityDialog() {
 
 // ---------- dados ----------
 
+// ---------- atualização ao vivo ----------
+
+let live = null;
+let liveVersion = null;
+let wantReload = false;
+const liveListeners = new Set(); // janelas abertas que também querem recarregar (conversas)
+
+// Não mexe na tela enquanto a pessoa arrasta algo ou digita num campo da página.
+function busy() {
+  const a = document.activeElement;
+  const typing = a && root.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && a.value;
+  return dragId != null || !!typing;
+}
+
+// Depois de um deploy, recarrega a página sozinho — só quando não atrapalha, e uma vez por versão.
+function maybeReload() {
+  if (!wantReload || busy() || document.querySelector('dialog[open]')) return;
+  try {
+    if (sessionStorage.getItem('recarregou') === wantReload) return;
+    sessionStorage.setItem('recarregou', wantReload);
+  } catch {
+    return;
+  }
+  location.reload();
+}
+
+function connectLive() {
+  if (live || !me || !window.EventSource) return;
+  const source = new EventSource('/api/events');
+  live = source;
+  source.addEventListener('hello', (e) => {
+    if (liveVersion && e.data !== liveVersion) wantReload = e.data;
+    liveVersion = liveVersion || e.data;
+    maybeReload();
+    refresh(); // pode ter perdido avisos enquanto estava desconectado
+  });
+  source.addEventListener('change', () => {
+    refresh();
+    for (const fn of liveListeners) fn();
+  });
+  source.onerror = () => {
+    // Queda de rede: o navegador reconecta sozinho. Recusa do servidor (deploy, sessão): tentamos de novo.
+    if (source.readyState !== EventSource.CLOSED) return;
+    if (live === source) live = null;
+    setTimeout(connectLive, 5000);
+  };
+}
+
+function disconnectLive() {
+  if (live) live.close();
+  live = null;
+}
+
 async function refresh(force = false) {
   if (!me) return;
-  if (!force) {
-    const a = document.activeElement;
-    const typing = a && root.contains(a) && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && a.value;
-    if (document.querySelector('dialog[open]') || dragId != null || typing) return;
-  }
+  connectLive();
+  if (!force && busy()) return;
   try {
     const [s, p] = await Promise.all([api('GET', '/state'), me.is_admin ? api('GET', '/users') : null]);
     const json = JSON.stringify([s, p]);
@@ -1918,6 +2112,7 @@ function loginView() {
 
 function render() {
   if (!me) {
+    disconnectLive();
     for (const d of document.querySelectorAll('dialog')) d.remove();
     root.replaceChildren(loginView());
     return;
@@ -1926,6 +2121,12 @@ function render() {
   if (view === 'people' && !me.is_admin) view = 'tasks';
   const boardScroll = root.querySelector('.board');
   const scrollLeft = boardScroll ? boardScroll.scrollLeft : 0;
+  // Se a pessoa está digitando uma nova tarefa, o texto sobrevive ao redesenho da tela.
+  const typed = document.activeElement;
+  const draft =
+    typed && typed.classList.contains('quick') && root.contains(typed)
+      ? { cat: typed.closest('.column').dataset.cat, value: typed.value, at: typed.selectionStart }
+      : null;
 
   const tab = (id, label, hash) =>
     el(
@@ -1957,6 +2158,11 @@ function render() {
       ),
       el(
         'button',
+        { class: 'btn quiet bell', type: 'button', 'aria-label': 'Buscar', title: 'Buscar (Ctrl+K)', onclick: spotlight },
+        lineIcon('M11 4a7 7 0 1 0 0 14a7 7 0 0 0 0-14z', 'M20 20l-4-4')
+      ),
+      el(
+        'button',
         {
           class: `btn quiet bell${state.activity_unread ? ' has' : ''}`,
           type: 'button',
@@ -1964,7 +2170,7 @@ function render() {
           title: 'Novidades',
           onclick: activityDialog,
         },
-        '🔔',
+        lineIcon('M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9', 'M13.73 21a2 2 0 0 1-3.46 0'),
         state.activity_unread > 0 && el('span', { class: 'badge' }, state.activity_unread > 99 ? '99+' : String(state.activity_unread))
       ),
       el('span', { class: 'who' }, me.name),
@@ -1994,6 +2200,13 @@ function render() {
     const q = root.querySelector(`.column[data-cat="${focusCat}"] .quick`);
     if (q) q.focus();
     focusCat = null;
+  } else if (draft && !document.querySelector('dialog[open]')) {
+    const q = root.querySelector(`.column[data-cat="${draft.cat}"] .quick`);
+    if (q) {
+      q.value = draft.value;
+      q.focus();
+      q.setSelectionRange(draft.at, draft.at);
+    }
   }
 }
 
@@ -2006,7 +2219,9 @@ function render() {
     return e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom;
   };
   const unsaved = (dlg) =>
-    dlg.classList.contains('item') ? [...dlg.querySelectorAll('.composer textarea')].some((t) => t.value.trim()) : dlg.dataset.dirty === '1';
+    dlg.classList.contains('spotlight')
+      ? false
+      : dlg.classList.contains('item') ? [...dlg.querySelectorAll('.composer textarea')].some((t) => t.value.trim()) : dlg.dataset.dirty === '1';
   let downOutside = false;
   document.addEventListener('input', (e) => {
     const dlg = e.target.closest && e.target.closest('dialog');
@@ -2039,6 +2254,10 @@ for (const type of ['dragover', 'drop']) {
   }
   render();
   await refresh(true);
-  setInterval(() => refresh(), 20000);
+  // Rede de segurança caso a conexão ao vivo esteja indisponível.
+  setInterval(() => {
+    refresh();
+    maybeReload();
+  }, 20000);
   window.addEventListener('focus', () => refresh());
 })();
