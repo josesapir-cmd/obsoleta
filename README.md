@@ -4,6 +4,7 @@ Quadro de tarefas e área de referências dos sócios da livraria.
 
 - **Tarefas**: colunas são categorias; cada tarefa tem situação (a fazer / em andamento / concluída), prazo e um ou mais responsáveis. Arraste os cartões entre colunas (no celular, troque a categoria ao editar a tarefa).
 - **Referências**: links, anotações e imagens agrupados por tema. Links ganham uma prévia (título, descrição e imagem da página); publicações públicas do Instagram podem ser abertas ali mesmo. Imagens são anexadas pelo botão "+ Imagem", pelo formulário ou arrastando arquivos sobre a referência.
+- **Comentários**: clicar numa tarefa abre a janela de leitura com a descrição e a conversa; o botão "Editar" fica no canto superior direito. Referências têm a mesma conversa. Digitar `@` sugere pessoas; quem é marcado vê um aviso "@ menções" no topo ao abrir o sistema (não há envio de e-mail).
 - **Pessoas**: não existe cadastro público. Só um admin cria, edita e desativa contas.
 
 Um único processo Node com banco SQLite em arquivo. Sem serviços externos.

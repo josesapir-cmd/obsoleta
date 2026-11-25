@@ -275,11 +275,54 @@ function sendImages(refId, list) {
   return act(() => uploadImages(refId, files));
 }
 
-function lightbox(imageId) {
+// Visualizador das imagens de uma referência: setas na tela, setas do teclado e deslizar no celular.
+function lightbox(ids, index) {
+  let i = index;
+  const img = el('img', { alt: 'Imagem anexada' });
+  const counter = el('span', { class: 'hint', 'aria-live': 'polite' });
+  const openLink = el('a', { class: 'btn', target: '_blank', rel: 'noopener' }, 'Abrir em nova aba');
+  const many = ids.length > 1;
+  const show = (n) => {
+    i = (n + ids.length) % ids.length;
+    img.src = `/api/images/${ids[i]}`;
+    openLink.href = img.src;
+    counter.textContent = many ? `${i + 1} de ${ids.length}` : '';
+    if (many) new Image().src = `/api/images/${ids[(i + 1) % ids.length]}`; // adianta a próxima
+  };
+  const nav = (dir, label, glyph) =>
+    many && el('button', { class: `nav ${dir < 0 ? 'prev' : 'next'}`, type: 'button', 'aria-label': label, title: label, onclick: () => show(i + dir) }, glyph);
+
+  let touchX = null;
+  const stage = el(
+    'div',
+    {
+      class: 'stage',
+      ontouchstart: (e) => {
+        touchX = e.touches.length === 1 ? e.touches[0].clientX : null;
+      },
+      ontouchend: (e) => {
+        if (touchX == null || !many) return;
+        const dx = e.changedTouches[0].clientX - touchX;
+        touchX = null;
+        if (Math.abs(dx) > 40) show(i + (dx < 0 ? 1 : -1));
+      },
+    },
+    nav(-1, 'Imagem anterior', '‹'),
+    img,
+    nav(1, 'Próxima imagem', '›')
+  );
+
   const dlg = el(
     'dialog',
-    { class: 'modal lightbox' },
-    el('img', { src: `/api/images/${imageId}`, alt: 'Imagem anexada' }),
+    {
+      class: 'modal lightbox',
+      onkeydown: (e) => {
+        if (!many || (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight')) return;
+        e.preventDefault();
+        show(i + (e.key === 'ArrowRight' ? 1 : -1));
+      },
+    },
+    stage,
     el(
       'div',
       { class: 'modal-actions' },
@@ -291,7 +334,7 @@ function lightbox(imageId) {
           onclick: async () => {
             if (!confirm('Excluir imagem? Não dá para desfazer.')) return;
             try {
-              await api('DELETE', `/images/${imageId}`);
+              await api('DELETE', `/images/${ids[i]}`);
             } catch (e) {
               toast(e.message);
             }
@@ -300,8 +343,9 @@ function lightbox(imageId) {
         },
         'Excluir imagem'
       ),
+      counter,
       el('span', { class: 'spacer' }),
-      el('a', { class: 'btn', href: `/api/images/${imageId}`, target: '_blank', rel: 'noopener' }, 'Abrir em nova aba'),
+      openLink,
       el('button', { class: 'btn primary', type: 'button', onclick: () => dlg.close() }, 'Fechar')
     )
   );
@@ -309,6 +353,327 @@ function lightbox(imageId) {
     dlg.remove();
     refresh(true);
   });
+  show(i);
+  document.body.append(dlg);
+  dlg.showModal();
+}
+
+// ---------- texto com menções e links ----------
+
+const WORD = /[\p{L}\p{N}_]/u;
+
+function mentionRanges(text) {
+  const users = [...state.users].sort((a, b) => b.name.length - a.name.length);
+  const lower = text.toLowerCase();
+  const out = [];
+  for (let i = lower.indexOf('@'); i >= 0; i = lower.indexOf('@', i + 1)) {
+    if (i > 0 && WORD.test(text[i - 1])) continue;
+    const u = users.find((c) => lower.startsWith(c.name.toLowerCase(), i + 1) && !WORD.test(text[i + 1 + c.name.length] || ''));
+    if (u) {
+      out.push({ start: i, end: i + 1 + u.name.length, user: u });
+      i += u.name.length;
+    }
+  }
+  return out;
+}
+
+function linkify(text) {
+  const out = [];
+  let last = 0;
+  for (const m of text.matchAll(/https?:\/\/[^\s<>"']+/g)) {
+    const url = m[0].replace(/[.,;:!?)]+$/, '');
+    out.push(text.slice(last, m.index), el('a', { href: url, target: '_blank', rel: 'noopener noreferrer' }, url));
+    last = m.index + url.length;
+  }
+  out.push(text.slice(last));
+  return out;
+}
+
+function richText(text) {
+  const out = [];
+  let last = 0;
+  for (const r of mentionRanges(text)) {
+    out.push(...linkify(text.slice(last, r.start)));
+    out.push(el('span', { class: `mention${r.user.id === me.id ? ' me' : ''}` }, `@${r.user.name}`));
+    last = r.end;
+  }
+  out.push(...linkify(text.slice(last)));
+  return out;
+}
+
+const fmtWhen = (sql) =>
+  new Date(`${sql.replace(' ', 'T')}Z`).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+
+// Sugestões de pessoas ao digitar "@" numa caixa de texto.
+function mentionSuggest(textarea) {
+  const box = el('ul', { class: 'suggest', hidden: true, role: 'listbox' });
+  let items = [];
+  let idx = 0;
+  let start = -1;
+  const pick = (u) => {
+    const v = textarea.value;
+    const head = `${v.slice(0, start)}@${u.name} `;
+    textarea.value = head + v.slice(textarea.selectionStart);
+    textarea.setSelectionRange(head.length, head.length);
+    box.hidden = true;
+    textarea.focus();
+  };
+  const draw = () => {
+    box.replaceChildren(
+      ...items.map((u, i) =>
+        el(
+          'li',
+          {
+            class: i === idx ? 'on' : '',
+            role: 'option',
+            'aria-selected': String(i === idx),
+            onmousedown: (e) => {
+              e.preventDefault();
+              pick(u);
+            },
+          },
+          avatar(u.id),
+          u.name
+        )
+      )
+    );
+  };
+  const update = () => {
+    const before = textarea.value.slice(0, textarea.selectionStart);
+    const m = /(^|[^\p{L}\p{N}_])@([\p{L}\p{N}_]*)$/u.exec(before);
+    if (!m) {
+      box.hidden = true;
+      return;
+    }
+    start = before.length - m[2].length - 1;
+    const query = m[2].toLowerCase();
+    items = state.users.filter((u) => u.active && u.id !== me.id && u.name.toLowerCase().split(/\s+/).some((part) => part.startsWith(query)));
+    idx = 0;
+    box.hidden = items.length === 0;
+    draw();
+  };
+  textarea.addEventListener('input', update);
+  textarea.addEventListener('blur', () => {
+    box.hidden = true;
+  });
+  textarea.addEventListener('keydown', (e) => {
+    if (box.hidden) return;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      idx = (idx + (e.key === 'ArrowDown' ? 1 : items.length - 1)) % items.length;
+      draw();
+    } else if (e.key === 'Enter' || e.key === 'Tab') {
+      pick(items[idx]);
+    } else if (e.key === 'Escape') {
+      box.hidden = true;
+    } else {
+      return;
+    }
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  });
+  return box;
+}
+
+// ---------- janela do item (leitura + comentários) ----------
+
+function itemDialog({ kind, id, title, details, onEdit }) {
+  const list = el('ol', { class: 'thread' });
+  let shown = '';
+  const load = async () => {
+    let comments;
+    try {
+      comments = await api('GET', `/comments?kind=${kind}&id=${id}`);
+    } catch {
+      return;
+    }
+    const json = JSON.stringify(comments);
+    if (json === shown) return;
+    shown = json;
+    list.replaceChildren(
+      ...(comments.length
+        ? comments.map((c) => {
+            const u = userById(c.user_id);
+            return el(
+              'li',
+              { class: 'comment' },
+              avatar(c.user_id),
+              el(
+                'div',
+                null,
+                el(
+                  'p',
+                  { class: 'comment-head' },
+                  el('strong', null, u ? u.name : 'Alguém'),
+                  el('span', { class: 'hint' }, fmtWhen(c.created_at)),
+                  (c.user_id === me.id || me.is_admin) &&
+                    el(
+                      'button',
+                      {
+                        class: 'linklike',
+                        type: 'button',
+                        onclick: async () => {
+                          if (!confirm('Excluir comentário?')) return;
+                          await api('DELETE', `/comments/${c.id}`).catch((e) => toast(e.message));
+                          load();
+                        },
+                      },
+                      'excluir'
+                    )
+                ),
+                el('p', { class: 'rich' }, richText(c.body))
+              )
+            );
+          })
+        : [el('li', { class: 'hint' }, 'Nenhum comentário ainda.')])
+    );
+    list.scrollTop = list.scrollHeight;
+  };
+
+  const err = el('p', { class: 'form-error', role: 'alert' });
+  const input = el('textarea', { rows: 2, placeholder: 'Escreva um comentário. Use @ para marcar alguém.', 'aria-label': 'Novo comentário', maxLength: 5000 });
+  const send = el('button', { class: 'btn primary', type: 'submit' }, 'Comentar');
+  const suggest = mentionSuggest(input);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) send.click();
+  });
+
+  const dlg = el(
+    'dialog',
+    { class: 'modal item' },
+    el(
+      'header',
+      { class: 'item-head' },
+      el('h2', null, title),
+      el('button', { class: 'btn', type: 'button', onclick: () => { dlg.close(); onEdit(); } }, 'Editar'),
+      el('button', { class: 'icon', type: 'button', 'aria-label': 'Fechar', title: 'Fechar', onclick: () => dlg.close() }, '✕')
+    ),
+    details,
+    el('h3', null, 'Comentários'),
+    list,
+    el(
+      'form',
+      {
+        class: 'composer',
+        onsubmit: async (e) => {
+          e.preventDefault();
+          if (!input.value.trim()) return;
+          err.textContent = '';
+          send.disabled = true;
+          try {
+            await api('POST', '/comments', { kind, id, body: input.value });
+            input.value = '';
+            await load();
+          } catch (ex) {
+            err.textContent = ex.message;
+          }
+          send.disabled = false;
+          input.focus();
+        },
+      },
+      el('div', { class: 'composer-box' }, input, suggest),
+      err,
+      el('div', { class: 'modal-actions' }, el('span', { class: 'hint' }, 'Ctrl+Enter envia'), el('span', { class: 'spacer' }), send)
+    )
+  );
+  const timer = setInterval(load, 20000);
+  dlg.addEventListener('close', () => {
+    clearInterval(timer);
+    dlg.remove();
+    refresh(true);
+  });
+  document.body.append(dlg);
+  dlg.showModal();
+  load();
+  api('POST', '/comments/seen', { kind, id }).catch(() => {});
+}
+
+function taskView(t) {
+  const cat = state.categories.find((c) => c.id === t.category_id);
+  const overdue = t.due_date && t.status !== 'done' && t.due_date < today();
+  itemDialog({
+    kind: 'task',
+    id: t.id,
+    title: t.title,
+    onEdit: () => taskDialog(t),
+    details: el(
+      'div',
+      { class: 'details' },
+      el(
+        'p',
+        { class: 'chips' },
+        cat && el('span', { class: `chip c-${cat.color}` }, cat.name),
+        el('span', { class: `pill s-${t.status}` }, STATUS[t.status]),
+        t.due_date && el('span', { class: `due${overdue ? ' overdue' : ''}` }, `Prazo: ${fmtDate(t.due_date)}${overdue ? ' (atrasada)' : ''}`)
+      ),
+      el(
+        'p',
+        { class: 'chips' },
+        t.assignees.length
+          ? t.assignees.map((id) => userById(id) && el('span', { class: 'person' }, avatar(id), userById(id).name))
+          : el('span', { class: 'hint' }, 'Sem responsável')
+      ),
+      t.description ? el('p', { class: 'rich' }, richText(t.description)) : el('p', { class: 'hint' }, 'Sem descrição.')
+    ),
+  });
+}
+
+function refView(r) {
+  const safe = /^https?:\/\//i.test(r.url);
+  const theme = state.themes.find((t) => t.id === r.theme_id);
+  itemDialog({
+    kind: 'ref',
+    id: r.id,
+    title: r.title,
+    onEdit: () => refDialog(r),
+    details: el(
+      'div',
+      { class: 'details' },
+      theme && el('p', { class: 'hint' }, `Tema: ${theme.name}`),
+      safe && el('p', { class: 'rich' }, el('a', { href: r.url, target: '_blank', rel: 'noopener noreferrer' }, r.url)),
+      r.note && el('p', { class: 'rich' }, richText(r.note))
+    ),
+  });
+}
+
+function mentionsDialog() {
+  const open = (m) => {
+    const item = (m.kind === 'task' ? state.tasks : state.refs).find((x) => x.id === m.target_id);
+    dlg.close();
+    if (!item) return toast('Esse item não existe mais.');
+    if (m.kind === 'task') taskView(item);
+    else refView(item);
+  };
+  const dlg = el(
+    'dialog',
+    { class: 'modal item' },
+    el(
+      'header',
+      { class: 'item-head' },
+      el('h2', null, 'Menções a você'),
+      el('button', { class: 'icon', type: 'button', 'aria-label': 'Fechar', title: 'Fechar', onclick: () => dlg.close() }, '✕')
+    ),
+    state.mentions.length === 0 && el('p', { class: 'hint' }, 'Nenhuma menção nova.'),
+    el(
+      'ul',
+      { class: 'mention-list' },
+      state.mentions.map((m) => {
+        const item = (m.kind === 'task' ? state.tasks : state.refs).find((x) => x.id === m.target_id);
+        const u = userById(m.user_id);
+        return el(
+          'li',
+          null,
+          el(
+            'button',
+            { type: 'button', onclick: () => open(m) },
+            el('strong', null, `${u ? u.name : 'Alguém'} em “${item ? item.title : 'item excluído'}”`),
+            el('span', { class: 'hint' }, ` · ${fmtWhen(m.created_at)}`),
+            el('span', { class: 'excerpt' }, m.body.length > 160 ? `${m.body.slice(0, 160)}…` : m.body)
+          )
+        );
+      })
+    )
+  );
+  dlg.addEventListener('close', () => dlg.remove());
   document.body.append(dlg);
   dlg.showModal();
 }
@@ -410,7 +775,7 @@ function card(t) {
         clearDropMarks();
       },
     },
-    el('button', { class: 'card-title', type: 'button', onclick: () => taskDialog(t) }, t.title),
+    el('button', { class: 'card-title', type: 'button', onclick: () => taskView(t) }, t.title),
     el(
       'div',
       { class: 'card-meta' },
@@ -425,6 +790,7 @@ function card(t) {
         STATUS[t.status]
       ),
       t.due_date && el('span', { class: `due${overdue ? ' overdue' : ''}` }, overdue ? `Atrasada · ${fmtDate(t.due_date)}` : fmtDate(t.due_date)),
+      t.comments > 0 && el('span', { class: 'due', title: 'Comentários' }, `💬 ${t.comments}`),
       el('span', { class: 'spacer' }),
       el('span', { class: 'avatars' }, t.assignees.map(avatar))
     )
@@ -686,8 +1052,8 @@ function refItem(r) {
       el(
         'div',
         { class: 'thumbs' },
-        r.images.map((id) =>
-          el('button', { class: 'thumb', type: 'button', 'aria-label': 'Ampliar imagem', onclick: () => lightbox(id) }, el('img', { src: `/api/images/${id}`, alt: '', loading: 'lazy' }))
+        r.images.map((id, n) =>
+          el('button', { class: 'thumb', type: 'button', 'aria-label': 'Ampliar imagem', onclick: () => lightbox(r.images, n) }, el('img', { src: `/api/images/${id}`, alt: '', loading: 'lazy' }))
         )
       ),
     el(
@@ -696,6 +1062,7 @@ function refItem(r) {
       el('span', null, [safe && host(r.url), by && `por ${by.name}`].filter(Boolean).join(' · ')),
       el('span', { class: 'spacer' }),
       picker,
+      el('button', { class: 'btn quiet small', type: 'button', onclick: () => refView(r) }, r.comments ? `💬 ${r.comments}` : 'Comentar'),
       el('button', { class: 'btn quiet small', type: 'button', onclick: () => picker.click() }, '+ Imagem')
     )
   );
@@ -868,6 +1235,11 @@ function render() {
       el('span', { class: 'brand' }, 'Obsoleta'),
       el('nav', null, tab('tasks', 'Tarefas', '#tarefas'), tab('refs', 'Referências', '#referencias'), me.is_admin && tab('people', 'Pessoas', '#pessoas')),
       el('span', { class: 'spacer' }),
+      el(
+        'button',
+        { class: `btn quiet${state.mentions.length ? ' alert' : ''}`, type: 'button', onclick: mentionsDialog },
+        state.mentions.length ? `@ ${state.mentions.length} ${state.mentions.length === 1 ? 'menção' : 'menções'}` : '@'
+      ),
       el('span', { class: 'who' }, me.name),
       el('button', { class: 'btn quiet', type: 'button', onclick: passwordDialog }, 'Senha'),
       el(

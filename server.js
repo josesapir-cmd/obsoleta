@@ -177,6 +177,24 @@ function createApp({ dbPath, uploadDir, production = false, admin, previewAllowP
     );
   `);
 
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS comments (
+      id INTEGER PRIMARY KEY,
+      kind TEXT NOT NULL,
+      target_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      body TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS comments_target ON comments (kind, target_id);
+    CREATE TABLE IF NOT EXISTS comment_mentions (
+      comment_id INTEGER NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      seen INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (comment_id, user_id)
+    );
+  `);
+
   // Migração: colunas da prévia de link, acrescentadas depois da primeira versão.
   const refCols = db.prepare('PRAGMA table_info(refs)').all().map((c) => c.name);
   for (const col of ['preview_title', 'preview_desc', 'preview_image', 'preview_site']) {
@@ -351,7 +369,16 @@ function createApp({ dbPath, uploadDir, production = false, admin, previewAllowP
       if (!images.has(r.ref_id)) images.set(r.ref_id, []);
       images.get(r.ref_id).push(r.id);
     }
+    const counts = new Map();
+    for (const r of q('SELECT kind, target_id, COUNT(*) AS n FROM comments GROUP BY kind, target_id').all()) {
+      counts.set(`${r.kind}:${r.target_id}`, r.n);
+    }
     res.json({
+      mentions: q(
+        `SELECT c.id AS comment_id, c.kind, c.target_id, c.user_id, c.body, c.created_at
+         FROM comment_mentions m JOIN comments c ON c.id = m.comment_id
+         WHERE m.user_id = ? AND m.seen = 0 ORDER BY c.id DESC`
+      ).all(req.user.id),
       users: q('SELECT id, name, active FROM users ORDER BY name COLLATE NOCASE').all(),
       categories: q('SELECT id, name, color FROM categories ORDER BY position, id').all(),
       tasks: q(
@@ -359,14 +386,14 @@ function createApp({ dbPath, uploadDir, production = false, admin, previewAllowP
          FROM tasks ORDER BY position, id`
       )
         .all()
-        .map((t) => ({ ...t, assignees: assignees.get(t.id) || [] })),
+        .map((t) => ({ ...t, assignees: assignees.get(t.id) || [], comments: counts.get(`task:${t.id}`) || 0 })),
       themes: q('SELECT id, name FROM themes ORDER BY position, id').all(),
       refs: q(
         `SELECT id, theme_id, title, url, note, created_by, preview_title, preview_desc, preview_image, preview_site
          FROM refs ORDER BY title COLLATE NOCASE`
       )
         .all()
-        .map((r) => ({ ...r, images: images.get(r.id) || [] })),
+        .map((r) => ({ ...r, images: images.get(r.id) || [], comments: counts.get(`ref:${r.id}`) || 0 })),
     });
   });
 
@@ -504,6 +531,7 @@ function createApp({ dbPath, uploadDir, production = false, admin, previewAllowP
   });
 
   api.delete('/tasks/:id', (req, res) => {
+    q("DELETE FROM comments WHERE kind = 'task' AND target_id = ?").run(intId(req.params.id));
     q('DELETE FROM tasks WHERE id = ?').run(intId(req.params.id));
     res.json({ ok: true });
   });
@@ -565,6 +593,7 @@ function createApp({ dbPath, uploadDir, production = false, admin, previewAllowP
   api.delete('/refs/:id', (req, res) => {
     const id = intId(req.params.id);
     const files = q('SELECT filename FROM ref_images WHERE ref_id = ?').all(id);
+    q("DELETE FROM comments WHERE kind = 'ref' AND target_id = ?").run(id);
     q('DELETE FROM refs WHERE id = ?').run(id);
     files.forEach((f) => removeFile(f.filename));
     res.json({ ok: true });
@@ -611,6 +640,76 @@ function createApp({ dbPath, uploadDir, production = false, admin, previewAllowP
     if (img) {
       q('DELETE FROM ref_images WHERE id = ?').run(id);
       removeFile(img.filename);
+    }
+    res.json({ ok: true });
+  });
+
+  // ---------- comentários ----------
+
+  const TARGETS = { task: 'tasks', ref: 'refs' };
+  function target(kind, id) {
+    if (!Object.hasOwn(TARGETS, kind)) bad('Tipo de item inválido.');
+    const targetId = intId(id, 'Item');
+    if (!q(`SELECT id FROM ${TARGETS[kind]} WHERE id = ?`).get(targetId)) throw new HttpError(404, 'Item não encontrado.');
+    return targetId;
+  }
+
+  // "@Nome Completo" de uma pessoa ativa vira menção. Nomes mais longos têm prioridade.
+  function mentionedUsers(body) {
+    const users = q('SELECT id, name FROM users WHERE active = 1').all().sort((a, b) => b.name.length - a.name.length);
+    const lower = body.toLowerCase();
+    const found = new Set();
+    const WORD = /[\p{L}\p{N}_]/u;
+    for (let i = lower.indexOf('@'); i >= 0; i = lower.indexOf('@', i + 1)) {
+      // O "@" precisa começar uma palavra (senão e-mails contariam como menção).
+      if (i > 0 && WORD.test(body[i - 1])) continue;
+      const u = users.find((c) => lower.startsWith(c.name.toLowerCase(), i + 1) && !WORD.test(body[i + 1 + c.name.length] || ''));
+      if (u) {
+        found.add(u.id);
+        i += u.name.length;
+      }
+    }
+    return found;
+  }
+
+  api.get('/comments', (req, res) => {
+    const id = target(req.query.kind, req.query.id);
+    res.json(
+      q('SELECT id, user_id, body, created_at FROM comments WHERE kind = ? AND target_id = ? ORDER BY id').all(req.query.kind, id)
+    );
+  });
+
+  api.post('/comments', (req, res) => {
+    const b = req.body;
+    const id = target(b.kind, b.id);
+    const body = text(b.body, 'Comentário', 5000, true);
+    const commentId = tx(() => {
+      const newId = Number(
+        q('INSERT INTO comments (kind, target_id, user_id, body) VALUES (?, ?, ?, ?)').run(b.kind, id, req.user.id, body).lastInsertRowid
+      );
+      for (const uid of mentionedUsers(body)) {
+        if (uid !== req.user.id) q('INSERT INTO comment_mentions (comment_id, user_id) VALUES (?, ?)').run(newId, uid);
+      }
+      return newId;
+    });
+    res.status(201).json({ id: commentId });
+  });
+
+  api.post('/comments/seen', (req, res) => {
+    const id = target(req.body.kind, req.body.id);
+    q(
+      `UPDATE comment_mentions SET seen = 1 WHERE user_id = ? AND comment_id IN
+         (SELECT id FROM comments WHERE kind = ? AND target_id = ?)`
+    ).run(req.user.id, req.body.kind, id);
+    res.json({ ok: true });
+  });
+
+  api.delete('/comments/:id', (req, res) => {
+    const id = intId(req.params.id);
+    const c = q('SELECT user_id FROM comments WHERE id = ?').get(id);
+    if (c) {
+      if (c.user_id !== req.user.id && !req.user.is_admin) throw new HttpError(403, 'Só quem escreveu ou um admin pode excluir.');
+      q('DELETE FROM comments WHERE id = ?').run(id);
     }
     res.json({ ok: true });
   });

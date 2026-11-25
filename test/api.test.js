@@ -187,3 +187,42 @@ test('bloqueia após tentativas repetidas de login', async () => {
   for (let i = 0; i < 9; i++) last = await c('POST', '/login', { email: 'ninguem@example.com', password: 'x' });
   assert.equal(last.status, 429);
 });
+
+test('comentários, menções e permissão de exclusão', async () => {
+  const ana = client();
+  await ana('POST', '/login', { email: 'ana@example.com', password: cookieOf.password });
+  await ana('POST', '/users', { name: 'Caio', email: 'caio@example.com', password: 'senha-do-caio-123' });
+  const caioFull = (await ana('POST', '/users', { name: 'Caio Reis', email: 'caioreis@example.com', password: 'senha-do-caio-456' })).body.id;
+  const caio = client();
+  await caio('POST', '/login', { email: 'caioreis@example.com', password: 'senha-do-caio-456' });
+
+  const cat = (await ana('POST', '/categories', { name: 'Obra' })).body.id;
+  const task = (await ana('POST', '/tasks', { category_id: cat, title: 'Orçar estantes' })).body.id;
+  assert.equal((await ana('POST', '/comments', { kind: 'task', id: 99999, body: 'x' })).status, 404);
+  assert.equal((await ana('POST', '/comments', { kind: 'users', id: 1, body: 'x' })).status, 400);
+  assert.equal((await ana('POST', '/comments', { kind: 'task', id: task, body: '  ' })).status, 400);
+
+  // "@Caio Reis" menciona só o nome mais longo; "@Ana" (a própria autora) não gera menção
+  const c1 = (await ana('POST', '/comments', { kind: 'task', id: task, body: 'Oi @caio reis, vê isso? cc @Ana email@caio.com' })).body.id;
+  let s = (await caio('GET', '/state')).body;
+  assert.deepEqual(s.mentions.map((m) => [m.comment_id, m.kind, m.target_id]), [[c1, 'task', task]]);
+  assert.equal(s.tasks.find((t) => t.id === task).comments, 1);
+  assert.equal((await ana('GET', '/state')).body.mentions.length, 0);
+  const caioShort = client();
+  await caioShort('POST', '/login', { email: 'caio@example.com', password: 'senha-do-caio-123' });
+  assert.equal((await caioShort('GET', '/state')).body.mentions.length, 0);
+
+  assert.equal((await caio('GET', `/comments?kind=task&id=${task}`)).body.length, 1);
+  await caio('POST', '/comments/seen', { kind: 'task', id: task });
+  assert.equal((await caio('GET', '/state')).body.mentions.length, 0);
+
+  // só o autor ou admin exclui
+  assert.equal((await caio('DELETE', `/comments/${c1}`)).status, 403);
+  const c2 = (await caio('POST', '/comments', { kind: 'task', id: task, body: 'Vejo sim' })).body.id;
+  assert.equal((await ana('DELETE', `/comments/${c2}`)).status, 200);
+
+  // excluir a tarefa leva os comentários junto
+  await ana('DELETE', `/tasks/${task}`);
+  assert.equal((await ana('GET', `/comments?kind=task&id=${task}`)).status, 404);
+  assert.equal(caioFull > 0, true);
+});
