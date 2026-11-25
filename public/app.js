@@ -142,6 +142,97 @@ function formDialog({ title, fields, submit = 'Salvar', onSubmit, onDelete, dele
         return multi ? on : on[0];
       };
       return el('fieldset', { class: 'field' }, el('legend', null, f.label), el('div', { class: multi ? 'checks' : 'swatches' }, boxes.map((b) => b.node)));
+    } else if (f.type === 'picker') {
+      // Escolha por busca: digita, aparecem sugestões, o escolhido vira uma etiqueta removível.
+      const chosen = [...f.value];
+      const label = (id) => (f.options.find(([v]) => v === id) || [])[1];
+      const chips = el('div', { class: 'picked' });
+      const box = el('ul', { class: 'suggest', hidden: true, role: 'listbox', id: `${id}-list` });
+      let matches = [];
+      let idx = 0;
+      const drawChips = () => {
+        chips.replaceChildren(
+          ...chosen
+            .filter((v) => label(v))
+            .map((v) =>
+              el(
+                'span',
+                { class: 'picked-item' },
+                label(v),
+                el(
+                  'button',
+                  {
+                    type: 'button',
+                    'aria-label': `Remover ${label(v)}`,
+                    title: 'Remover',
+                    onclick: () => {
+                      chosen.splice(chosen.indexOf(v), 1);
+                      dlg.dataset.dirty = '1';
+                      drawChips();
+                    },
+                  },
+                  '✕'
+                )
+              )
+            )
+        );
+      };
+      const pick = (v) => {
+        chosen.push(v);
+        input.value = '';
+        box.hidden = true;
+        drawChips();
+        input.focus();
+      };
+      const drawBox = () => {
+        box.replaceChildren(
+          ...matches.map(([v, text], i) =>
+            el(
+              'li',
+              {
+                class: i === idx ? 'on' : '',
+                role: 'option',
+                'aria-selected': String(i === idx),
+                onmousedown: (e) => {
+                  e.preventDefault();
+                  pick(v);
+                },
+              },
+              text
+            )
+          )
+        );
+        const on = box.querySelector('.on');
+        if (on) on.scrollIntoView({ block: 'nearest' });
+      };
+      const update = () => {
+        const terms = fold(input.value).split(/\s+/).filter(Boolean);
+        matches = terms.length ? f.options.filter(([v, text]) => !chosen.includes(v) && terms.every((t) => fold(text).includes(t))).slice(0, 8) : [];
+        idx = 0;
+        box.hidden = matches.length === 0;
+        drawBox();
+      };
+      input = el('input', { id, type: 'text', placeholder: f.placeholder, autocomplete: 'off', role: 'combobox', 'aria-controls': `${id}-list`, 'aria-autocomplete': 'list' });
+      input.addEventListener('input', update);
+      input.addEventListener('blur', () => {
+        box.hidden = true;
+      });
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault(); // Enter aqui escolhe a sugestão; não salva o formulário
+          if (!box.hidden) pick(matches[idx][0]);
+        } else if (!box.hidden && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+          e.preventDefault();
+          idx = (idx + (e.key === 'ArrowDown' ? 1 : matches.length - 1)) % matches.length;
+          drawBox();
+        } else if (!box.hidden && e.key === 'Escape') {
+          e.preventDefault();
+          box.hidden = true;
+        }
+      });
+      drawChips();
+      getters[f.name] = () => chosen.filter((v) => label(v));
+      return el('div', { class: 'field' }, el('label', { for: id }, f.label), chips, el('div', { class: 'composer-box' }, input, box), f.hint && el('p', { class: 'hint' }, f.hint));
     } else if (f.type === 'files') {
       const info = el('p', { class: 'hint' }, f.hint);
       const show = () => {
@@ -1205,7 +1296,8 @@ function taskDialog(task) {
       state.tasks.length > 1 && {
         name: 'depends_on',
         label: 'Depende de (precisa estar concluída antes)',
-        type: 'checks',
+        type: 'picker',
+        placeholder: 'Digite para buscar uma tarefa…',
         value: task.depends_on,
         options: state.categories.flatMap((c) =>
           state.tasks.filter((o) => o.category_id === c.id && o.id !== task.id).map((o) => [o.id, `${o.title} · ${c.name}${o.status === 'done' ? ' ✓' : ''}`])

@@ -482,6 +482,14 @@ main.tasks { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .spot-main { display: flex; flex-direction: column; min-width: 0; }
 .spot-main strong, .spot-main .hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+.picked { display: flex; flex-direction: column; gap: 4px; }
+.picked:empty { display: none; }
+.picked-item { display: flex; align-items: center; gap: 8px; border: 1px solid var(--line); background: var(--card); border-radius: 6px; padding: 5px 6px 5px 10px; font-size: 14px; overflow-wrap: anywhere; }
+.picked-item button { margin-left: auto; flex: none; border: 0; background: none; color: var(--muted); cursor: pointer; width: 26px; height: 26px; border-radius: 5px; }
+.picked-item button:hover { background: var(--line); color: var(--ink); }
+.composer-box > input { width: 100%; }
+.suggest li { overflow-wrap: anywhere; }
+
 /* ---------- novidades ---------- */
 
 .bell { position: relative; padding-left: 8px; padding-right: 8px; display: inline-flex; align-items: center; }
