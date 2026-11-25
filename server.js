@@ -254,6 +254,26 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       uploaded_by INTEGER REFERENCES users(id),
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+    CREATE TABLE IF NOT EXISTS expenses (
+      id INTEGER PRIMARY KEY,
+      date TEXT NOT NULL,
+      description TEXT NOT NULL,
+      amount_cents INTEGER NOT NULL,
+      paid_by INTEGER NOT NULL REFERENCES users(id),
+      note TEXT NOT NULL DEFAULT '',
+      settled_at TEXT,
+      created_by INTEGER REFERENCES users(id),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS expense_files (
+      id INTEGER PRIMARY KEY,
+      expense_id INTEGER NOT NULL REFERENCES expenses(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      filename TEXT NOT NULL UNIQUE,
+      size INTEGER NOT NULL,
+      uploaded_by INTEGER REFERENCES users(id),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
     CREATE TABLE IF NOT EXISTS passkeys (
       id INTEGER PRIMARY KEY,
       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -677,6 +697,11 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       if (!deps.has(r.task_id)) deps.set(r.task_id, []);
       deps.get(r.task_id).push(r.depends_on_id);
     }
+    const receipts = new Map();
+    for (const r of q('SELECT id, expense_id, name, size FROM expense_files ORDER BY id').all()) {
+      if (!receipts.has(r.expense_id)) receipts.set(r.expense_id, []);
+      receipts.get(r.expense_id).push({ id: r.id, name: r.name, size: r.size });
+    }
     const counts = new Map();
     for (const r of q('SELECT kind, target_id, COUNT(*) AS n FROM comments GROUP BY kind, target_id').all()) {
       counts.set(`${r.kind}:${r.target_id}`, r.n);
@@ -704,6 +729,9 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
         .map((t) => ({ ...t, assignees: assignees.get(t.id) || [], depends_on: deps.get(t.id) || [], comments: counts.get(`task:${t.id}`) || 0 })),
       themes: q('SELECT id, name FROM themes ORDER BY position, id').all(),
       folders: q('SELECT id, name FROM folders ORDER BY position, id').all(),
+      expenses: q('SELECT id, date, description, amount_cents, paid_by, note, settled_at, created_by FROM expenses ORDER BY date DESC, id DESC')
+        .all()
+        .map((e) => ({ ...e, files: receipts.get(e.id) || [] })),
       files: q('SELECT id, folder_id, name, size, uploaded_by, created_at FROM files ORDER BY name COLLATE NOCASE').all(),
       refs: q(
         `SELECT id, theme_id, title, url, note, created_by, preview_title, preview_desc, preview_image, preview_site
@@ -1077,8 +1105,7 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
   };
 
   // O corpo da requisição é o próprio arquivo, gravado direto em disco (sem passar pela memória).
-  api.post('/folders/:id/files', async (req, res) => {
-    const folder = folderId(req.params.id);
+  async function receiveUpload(req) {
     const name = fileName(req.get('X-File-Name'));
     const tooBig = () => new HttpError(413, 'Arquivo grande demais (máximo de 50 MB).');
     if (Number(req.get('Content-Length')) > MAX_FILE_BYTES) throw tooBig();
@@ -1098,13 +1125,10 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       fs.rm(full, { force: true }, () => {});
       throw e.status ? e : new HttpError(400, 'O envio foi interrompido. Tente de novo.');
     }
-    const r = q('INSERT INTO files (folder_id, name, filename, size, uploaded_by) VALUES (?, ?, ?, ?, ?)').run(folder, name, stored, size, req.user.id);
-    log(req, 'enviou o arquivo', 'files', Number(r.lastInsertRowid), name, `Na pasta ${q('SELECT name FROM folders WHERE id = ?').get(folder).name}`);
-    res.status(201).json({ id: Number(r.lastInsertRowid) });
-  });
+    return { name, stored, size };
+  }
 
-  api.get('/files/:id', (req, res) => {
-    const f = q('SELECT name, filename FROM files WHERE id = ?').get(intId(req.params.id));
+  function sendStored(req, res, f) {
     if (!f) throw new HttpError(404, 'Arquivo não encontrado.');
     const ext = f.name.includes('.') ? f.name.split('.').pop().toLowerCase() : '';
     const inline = Object.hasOwn(INLINE_TYPES, ext) && req.query.download === undefined;
@@ -1123,6 +1147,18 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
         if (err && !res.headersSent) res.status(404).json({ error: 'Arquivo não encontrado.' });
       }
     );
+  }
+
+  api.post('/folders/:id/files', async (req, res) => {
+    const folder = folderId(req.params.id);
+    const { name, stored, size } = await receiveUpload(req);
+    const r = q('INSERT INTO files (folder_id, name, filename, size, uploaded_by) VALUES (?, ?, ?, ?, ?)').run(folder, name, stored, size, req.user.id);
+    log(req, 'enviou o arquivo', 'files', Number(r.lastInsertRowid), name, `Na pasta ${q('SELECT name FROM folders WHERE id = ?').get(folder).name}`);
+    res.status(201).json({ id: Number(r.lastInsertRowid) });
+  });
+
+  api.get('/files/:id', (req, res) => {
+    sendStored(req, res, q('SELECT name, filename FROM files WHERE id = ?').get(intId(req.params.id)));
   });
 
   api.patch('/files/:id', (req, res) => {
@@ -1143,6 +1179,123 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
     if (f) {
       log(req, 'excluiu o arquivo', 'files', null, f.name);
       q('DELETE FROM files WHERE id = ?').run(id);
+      fs.rm(path.join(filesDir, f.filename), { force: true }, () => {});
+    }
+    res.json({ ok: true });
+  });
+
+  // ---------- conta corrente dos sócios ----------
+
+  const money = (cents) => `R$ ${(cents / 100).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const userName = (id) => (q('SELECT name FROM users WHERE id = ?').get(id) || {}).name || 'alguém';
+
+  function expenseFields(b, current) {
+    const date = 'date' in b ? dueDate(b.date) : current && current.date;
+    if (!date) bad('Data é obrigatória.');
+    const cents = 'amount_cents' in b ? b.amount_cents : current && current.amount_cents;
+    if (!Number.isSafeInteger(cents) || cents <= 0 || cents > 1e11) bad('Valor inválido.');
+    const paidBy = 'paid_by' in b ? intId(b.paid_by, 'Quem pagou') : current && current.paid_by;
+    if (!q('SELECT id FROM users WHERE id = ?').get(paidBy)) bad('Pessoa inexistente.');
+    return {
+      date,
+      cents,
+      paidBy,
+      description: 'description' in b ? text(b.description, 'Descrição', 200, true) : current && current.description,
+      note: 'note' in b ? text(b.note, 'Observação', 2000) : current ? current.note : '',
+    };
+  }
+
+  // Dinheiro pede mais cuidado: só quem lançou, quem pagou ou um admin altera um gasto;
+  // depois de acertado, só um admin.
+  function editableExpense(req, id) {
+    const e = q('SELECT * FROM expenses WHERE id = ?').get(intId(id));
+    if (!e) throw new HttpError(404, 'Gasto não encontrado.');
+    const own = e.created_by === req.user.id || e.paid_by === req.user.id;
+    if (!req.user.is_admin && (!own || e.settled_at)) {
+      throw new HttpError(403, e.settled_at ? 'Esse gasto já foi acertado; só um admin pode alterá-lo.' : 'Só quem lançou, quem pagou ou um admin pode alterar esse gasto.');
+    }
+    return e;
+  }
+
+  api.post('/expenses', (req, res) => {
+    const f = expenseFields({ paid_by: req.user.id, ...req.body }, null);
+    if (!f.description) bad('Descrição é obrigatória.');
+    const r = q('INSERT INTO expenses (date, description, amount_cents, paid_by, note, created_by) VALUES (?, ?, ?, ?, ?, ?)').run(
+      f.date,
+      f.description,
+      f.cents,
+      f.paidBy,
+      f.note,
+      req.user.id
+    );
+    log(req, 'lançou o gasto', 'expenses', Number(r.lastInsertRowid), f.description, `${money(f.cents)} · pago por ${userName(f.paidBy)}`);
+    res.status(201).json({ id: Number(r.lastInsertRowid) });
+  });
+
+  api.patch('/expenses/:id', (req, res) => {
+    const e = editableExpense(req, req.params.id);
+    const f = expenseFields(req.body, e);
+    let settledAt = e.settled_at;
+    if ('settled' in req.body && !!req.body.settled !== !!e.settled_at) {
+      if (!req.user.is_admin) throw new HttpError(403, 'Só um admin marca ou desmarca um gasto como acertado.');
+      settledAt = req.body.settled ? new Date().toISOString().slice(0, 19).replace('T', ' ') : null;
+    }
+    q('UPDATE expenses SET date = ?, description = ?, amount_cents = ?, paid_by = ?, note = ?, settled_at = ? WHERE id = ?').run(
+      f.date,
+      f.description,
+      f.cents,
+      f.paidBy,
+      f.note,
+      settledAt,
+      e.id
+    );
+    const changes = [];
+    if (f.cents !== e.amount_cents) changes.push(`valor de ${money(e.amount_cents)} para ${money(f.cents)}`);
+    if (f.paidBy !== e.paid_by) changes.push(`quem pagou de ${userName(e.paid_by)} para ${userName(f.paidBy)}`);
+    if (f.date !== e.date) changes.push('data');
+    if (f.description !== e.description) changes.push(`descrição (era "${e.description}")`);
+    if (!!settledAt !== !!e.settled_at) changes.push(settledAt ? 'marcado como acertado' : 'reaberto');
+    if (changes.length) log(req, 'alterou o gasto', 'expenses', e.id, f.description, `Mudou: ${changes.join('; ')}`);
+    res.json({ ok: true });
+  });
+
+  api.delete('/expenses/:id', (req, res) => {
+    const e = editableExpense(req, req.params.id);
+    const files = q('SELECT filename FROM expense_files WHERE expense_id = ?').all(e.id);
+    log(req, 'excluiu o gasto', 'expenses', null, e.description, `${money(e.amount_cents)} · pago por ${userName(e.paid_by)}`);
+    q('DELETE FROM expenses WHERE id = ?').run(e.id);
+    files.forEach((f) => fs.rm(path.join(filesDir, f.filename), { force: true }, () => {}));
+    res.json({ ok: true });
+  });
+
+  // Fecha o acerto: tudo que está em aberto passa a constar como acertado.
+  api.post('/expenses/settle', adminOnly, (req, res) => {
+    const open = q('SELECT COUNT(*) AS n, COALESCE(SUM(amount_cents), 0) AS total FROM expenses WHERE settled_at IS NULL').get();
+    if (!open.n) bad('Não há gastos em aberto.');
+    q("UPDATE expenses SET settled_at = datetime('now') WHERE settled_at IS NULL").run();
+    log(req, 'fechou o acerto da conta corrente', 'expenses', null, `${open.n} gasto(s)`, `Total acertado: ${money(open.total)}`);
+    res.json({ count: open.n, total_cents: open.total });
+  });
+
+  api.post('/expenses/:id/files', async (req, res) => {
+    const e = editableExpense(req, req.params.id);
+    if (q('SELECT COUNT(*) AS n FROM expense_files WHERE expense_id = ?').get(e.id).n >= 20) bad('Limite de 20 anexos por gasto.');
+    const { name, stored, size } = await receiveUpload(req);
+    const r = q('INSERT INTO expense_files (expense_id, name, filename, size, uploaded_by) VALUES (?, ?, ?, ?, ?)').run(e.id, name, stored, size, req.user.id);
+    log(req, 'anexou comprovante ao gasto', 'expenses', e.id, e.description);
+    res.status(201).json({ id: Number(r.lastInsertRowid) });
+  });
+
+  api.get('/expense-files/:id', (req, res) => {
+    sendStored(req, res, q('SELECT name, filename FROM expense_files WHERE id = ?').get(intId(req.params.id)));
+  });
+
+  api.delete('/expense-files/:id', (req, res) => {
+    const id = intId(req.params.id);
+    const f = q('SELECT expense_id, filename FROM expense_files WHERE id = ?').get(id);
+    if (f) {
+      editableExpense(req, f.expense_id);
+      q('DELETE FROM expense_files WHERE id = ?').run(id);
       fs.rm(path.join(filesDir, f.filename), { force: true }, () => {});
     }
     res.json({ ok: true });

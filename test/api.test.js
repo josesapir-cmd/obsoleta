@@ -441,3 +441,55 @@ test('busca em comentários ignora acentos e exige todos os termos', async () =>
   assert.deepEqual(await find('   '), []);
   assert.equal((await fetch(`${base}/search?q=x`)).status, 401);
 });
+
+test('conta corrente: lançar, permissões, anexos e acerto', async () => {
+  const ana = client(); // admin
+  await ana('POST', '/login', { email: 'ana@example.com', password: cookieOf.password });
+  const dora = client();
+  await dora('POST', '/login', { email: 'dora@example.com', password: 'senha-da-dora-123' });
+  const caio = client();
+  await caio('POST', '/login', { email: 'caioreis@example.com', password: 'senha-do-caio-456' });
+  const doraId = (await dora('GET', '/me')).body.id;
+
+  assert.equal((await dora('POST', '/expenses', { date: '2026-11-20', description: 'Taxa da junta', amount_cents: 0 })).status, 400);
+  assert.equal((await dora('POST', '/expenses', { date: '2026-11-20', description: 'Taxa da junta', amount_cents: 12.5 })).status, 400);
+  assert.equal((await dora('POST', '/expenses', { description: 'Sem data', amount_cents: 100 })).status, 400);
+  const e1 = (await dora('POST', '/expenses', { date: '2026-11-20', description: 'Taxa da junta', amount_cents: 23450 })).body.id;
+  const e2 = (await caio('POST', '/expenses', { date: '2026-11-21', description: 'Contador', amount_cents: 80000, paid_by: doraId })).body.id;
+
+  let s = (await ana('GET', '/state')).body;
+  assert.equal(s.expenses.find((e) => e.id === e1).paid_by, doraId);
+  assert.equal(s.expenses.filter((e) => e.paid_by === doraId).reduce((n, e) => n + e.amount_cents, 0), 103450);
+
+  // Caio lançou e2 (pode editar), mas não tem nada a ver com e1
+  assert.equal((await caio('PATCH', `/expenses/${e1}`, { amount_cents: 1 })).status, 403);
+  assert.equal((await caio('DELETE', `/expenses/${e1}`)).status, 403);
+  assert.equal((await caio('PATCH', `/expenses/${e2}`, { amount_cents: 85000 })).status, 200);
+  assert.equal((await caio('PATCH', `/expenses/${e2}`, { settled: true })).status, 403);
+  const feed = (await ana('GET', '/activity')).body;
+  assert.equal(feed[0].text, 'alterou o gasto');
+  assert.match(feed[0].detail, /valor de R\$ 800,00 para R\$ 850,00/);
+
+  // anexos
+  const up = (who, id) =>
+    fetch(`${base}/expenses/${id}/files`, { method: 'POST', headers: { 'X-Requested-With': 'obsoleta', 'X-File-Name': 'recibo.pdf', cookie: who.cookie() }, body: Buffer.from('%PDF recibo') });
+  assert.equal((await up(caio, e1)).status, 403);
+  const fileId = (await (await up(dora, e1)).json()).id;
+  s = (await ana('GET', '/state')).body;
+  assert.deepEqual(s.expenses.find((e) => e.id === e1).files, [{ id: fileId, name: 'recibo.pdf', size: 11 }]);
+  const got = await fetch(`${base}/expense-files/${fileId}`, { headers: { cookie: caio.cookie() } });
+  assert.equal(await got.text(), '%PDF recibo');
+  assert.equal((await fetch(`${base}/expense-files/${fileId}`)).status, 401);
+  assert.equal((await caio('DELETE', `/expense-files/${fileId}`)).status, 403);
+
+  // acerto: só admin; depois disso o gasto fica travado para quem não é admin
+  assert.equal((await dora('POST', '/expenses/settle', {})).status, 403);
+  const settle = await ana('POST', '/expenses/settle', {});
+  assert.deepEqual(settle.body, { count: 2, total_cents: 108450 });
+  assert.equal((await ana('POST', '/expenses/settle', {})).status, 400);
+  assert.equal((await dora('PATCH', `/expenses/${e1}`, { amount_cents: 1 })).status, 403);
+  assert.equal((await dora('DELETE', `/expenses/${e1}`)).status, 403);
+  assert.equal((await ana('PATCH', `/expenses/${e1}`, { settled: false })).status, 200);
+  assert.equal((await dora('DELETE', `/expenses/${e1}`)).status, 200);
+  assert.equal((await fetch(`${base}/expense-files/${fileId}`, { headers: { cookie: caio.cookie() } })).status, 404);
+});

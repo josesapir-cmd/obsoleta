@@ -10,7 +10,8 @@ let me = null;
 let state = null;
 let stateJson = '';
 let people = null; // lista completa, só para admin
-let view = { '#referencias': 'refs', '#arquivos': 'files' }[location.hash] || 'tasks';
+let view = { '#referencias': 'refs', '#arquivos': 'files', '#conta': 'ledger' }[location.hash] || 'tasks';
+let showSettled = false;
 const filter = { who: 'all', hideDone: false };
 let dragId = null;
 let focusCat = null;
@@ -144,13 +145,13 @@ function formDialog({ title, fields, submit = 'Salvar', onSubmit, onDelete, dele
     } else if (f.type === 'files') {
       const info = el('p', { class: 'hint' }, f.hint);
       const show = () => {
-        info.textContent = picked.length ? `${picked.length} imagem(ns) para enviar ao salvar.` : f.hint;
+        info.textContent = picked.length ? `${picked.length} ${f.any ? 'arquivo(s)' : 'imagem(ns)'} para enviar ao salvar.` : f.hint;
       };
       addFiles = (list) => {
-        picked.push(...imagesOnly(list));
+        picked.push(...(f.any ? [...list] : imagesOnly(list)));
         show();
       };
-      input = el('input', { id, type: 'file', accept: IMAGE_TYPES, multiple: true, onchange: () => { addFiles(input.files); input.value = ''; } });
+      input = el('input', { id, type: 'file', accept: f.any ? null : IMAGE_TYPES, multiple: true, onchange: () => { addFiles(input.files); input.value = ''; } });
       getters[f.name] = () => picked;
       return el('div', { class: 'field' }, el('label', { for: id }, f.label), input, info);
     } else if (f.type === 'checkbox') {
@@ -166,6 +167,7 @@ function formDialog({ title, fields, submit = 'Salvar', onSubmit, onDelete, dele
         autocomplete: f.autocomplete || 'off',
         minLength: f.minLength,
         placeholder: f.placeholder,
+        inputMode: f.inputMode,
       });
       getters[f.name] = () => input.value;
     }
@@ -788,7 +790,15 @@ function refView(r) {
       { class: 'details' },
       theme && el('p', { class: 'hint' }, `Tema: ${theme.name}`),
       safe && el('p', { class: 'rich' }, el('a', { href: r.url, target: '_blank', rel: 'noopener noreferrer' }, r.url)),
-      r.note && el('p', { class: 'rich' }, richText(r.note))
+      r.note && el('p', { class: 'rich' }, richText(r.note)),
+      r.images.length > 0 &&
+        el(
+          'div',
+          { class: 'thumbs big' },
+          r.images.map((id, n) =>
+            el('button', { class: 'thumb', type: 'button', 'aria-label': 'Ampliar imagem', onclick: () => lightbox(r.images, n) }, el('img', { src: `/api/images/${id}`, alt: '', loading: 'lazy' }), reactionBadge(id))
+          )
+        )
     ),
   });
 }
@@ -862,6 +872,23 @@ function searchLocal(query) {
     if (!inTitle && !has(r.title, r.note, r.url, r.preview_title, r.preview_desc, theme)) continue;
     out.push({ type: 'Referência', title: r.title, sub: [theme, r.note.slice(0, 80)].filter(Boolean).join(' · '), rank: inTitle ? 0 : 1, open: () => refView(r) });
   }
+  for (const e of state.expenses) {
+    const payer = (userById(e.paid_by) || {}).name;
+    const inTitle = has(e.description);
+    if (!inTitle && !has(e.description, e.note, payer, ...e.files.map((f) => f.name))) continue;
+    out.push({
+      type: 'Gasto',
+      title: e.description,
+      sub: `${money(e.amount_cents)} · ${payer} · ${fmtDate(e.date)}`,
+      rank: inTitle ? 0 : 1,
+      open: () => {
+        view = 'ledger';
+        if (e.settled_at) showSettled = true;
+        history.replaceState(null, '', '#conta');
+        render();
+      },
+    });
+  }
   for (const f of state.files) {
     const folder = name(state.folders, f.folder_id);
     const inTitle = has(f.name);
@@ -878,7 +905,7 @@ function spotlight() {
   let seq = 0;
   let timer;
   const list = el('ul', { class: 'spot-results', role: 'listbox', id: 'spot-results' });
-  const status = el('p', { class: 'hint spot-status' }, 'Busca em tarefas, referências, arquivos e comentários.');
+  const status = el('p', { class: 'hint spot-status' }, 'Busca em tarefas, referências, arquivos, gastos e comentários.');
   const input = el('input', {
     type: 'search',
     placeholder: 'Buscar…',
@@ -905,7 +932,7 @@ function spotlight() {
     const on = list.querySelector('.on');
     if (on) on.scrollIntoView({ block: 'nearest' });
     status.hidden = results.length > 0;
-    if (!results.length) status.textContent = input.value.trim() ? 'Nada encontrado.' : 'Busca em tarefas, referências, arquivos e comentários.';
+    if (!results.length) status.textContent = input.value.trim() ? 'Nada encontrado.' : 'Busca em tarefas, referências, arquivos, gastos e comentários.';
   };
   const run = () => {
     const query = input.value;
@@ -937,6 +964,8 @@ function spotlight() {
       draw();
     } else if (e.key === 'Enter') {
       if (results[idx]) choose(results[idx]);
+    } else if (e.key === 'Escape') {
+      dlg.close(); // sem isto, o primeiro Esc só limpa o campo
     } else {
       return;
     }
@@ -984,6 +1013,7 @@ function openActivityTarget(a) {
     return refView(r);
   }
   if (a.kind === 'files' || a.kind === 'folders') return go('files', '#arquivos');
+  if (a.kind === 'expenses') return go('ledger', '#conta');
   if (a.kind === 'themes') return go('refs', '#referencias');
   if (a.kind === 'categories') return go('tasks', '#tarefas');
   if (a.kind === 'users' && me.is_admin) return go('people', '#pessoas');
@@ -1594,10 +1624,10 @@ function fmtSize(n) {
   return `${(n / 1024 / 1024).toFixed(1).replace('.', ',')} MB`;
 }
 
-function uploadFile(folderId, file, onProgress) {
+function uploadFile(url, file, onProgress) {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', `/api/folders/${folderId}/files`);
+    xhr.open('POST', `/api${url}`);
     xhr.setRequestHeader('X-Requested-With', 'obsoleta');
     xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
     xhr.setRequestHeader('Content-Type', 'application/octet-stream');
@@ -1615,7 +1645,7 @@ function uploadFile(folderId, file, onProgress) {
   });
 }
 
-async function sendFiles(folderId, list) {
+async function sendFiles(url, list) {
   const files = [...list];
   if (!files.length) return;
   dragId = -1; // segura a atualização automática da tela durante o envio
@@ -1627,7 +1657,7 @@ async function sendFiles(folderId, list) {
       if (!f.size) throw new Error(`"${f.name}" está vazio (ou é uma pasta — envie os arquivos de dentro dela).`);
       const label = files.length > 1 ? `Enviando ${n} de ${files.length}` : 'Enviando';
       toast(`${label}: ${f.name}…`);
-      await uploadFile(folderId, f, (frac) => toast(`${label}: ${f.name} (${Math.round(frac * 100)}%)`));
+      await uploadFile(url, f, (frac) => toast(`${label}: ${f.name} (${Math.round(frac * 100)}%)`));
     }
     toast(n === 1 ? 'Arquivo enviado.' : `${n} arquivos enviados.`);
   } catch (e) {
@@ -1705,7 +1735,7 @@ function filesView() {
       { class: 'themes' },
       state.folders.map((d) => {
         const files = state.files.filter((f) => f.folder_id === d.id);
-        const picker = el('input', { type: 'file', multiple: true, hidden: true, onchange: () => sendFiles(d.id, picker.files) });
+        const picker = el('input', { type: 'file', multiple: true, hidden: true, onchange: () => sendFiles(`/folders/${d.id}/files`, picker.files) });
         return el(
           'section',
           {
@@ -1722,7 +1752,7 @@ function filesView() {
               if (!hasFiles(e)) return;
               e.preventDefault();
               e.currentTarget.classList.remove('drop-here');
-              sendFiles(d.id, e.dataTransfer.files);
+              sendFiles(`/folders/${d.id}/files`, e.dataTransfer.files);
             },
           },
           el(
@@ -1739,6 +1769,197 @@ function filesView() {
       })
     ),
     state.folders.length > 0 && el('p', { class: 'hint empty' }, 'No computador, arraste arquivos para cima de uma pasta. Limite de 50 MB por arquivo.')
+  );
+}
+
+// ---------- conta corrente dos sócios ----------
+
+const money = (cents) => (cents / 100).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+
+// Aceita "1.234,56", "1234,5", "1234.56", "R$ 80". Devolve centavos ou lança erro.
+function parseMoney(input) {
+  let v = String(input).trim().replace(/^R\$\s*/i, '').replace(/\s/g, '');
+  if (/^\d{1,3}(\.\d{3})+(,\d{1,2})?$/.test(v) || /^\d+,\d{1,2}$/.test(v)) v = v.replace(/\./g, '').replace(',', '.');
+  if (!/^\d+(\.\d{1,2})?$/.test(v)) throw new Error('Valor inválido. Use o formato 1.234,56.');
+  const cents = Math.round(parseFloat(v) * 100);
+  if (cents <= 0) throw new Error('O valor precisa ser maior que zero.');
+  return cents;
+}
+
+const canEditExpense = (e) => me.is_admin || (!e.settled_at && (e.created_by === me.id || e.paid_by === me.id));
+
+function expenseDialog(e) {
+  const people = state.users.filter((u) => u.active || (e && e.paid_by === u.id));
+  formDialog({
+    title: e ? 'Editar gasto' : 'Lançar gasto',
+    fields: [
+      { name: 'description', label: 'O que foi', value: e && e.description, required: true, placeholder: 'Ex.: taxa da junta comercial' },
+      { name: 'amount', label: 'Valor (R$)', value: e ? (e.amount_cents / 100).toLocaleString('pt-BR', { minimumFractionDigits: 2 }) : '', required: true, placeholder: '0,00', inputMode: 'decimal' },
+      { name: 'date', label: 'Data do gasto', type: 'date', value: e ? e.date : today(), required: true },
+      { name: 'paid_by', label: 'Quem pagou', type: 'select', numeric: true, value: e ? e.paid_by : me.id, options: people.map((u) => [u.id, u.name]) },
+      { name: 'note', label: 'Observação', type: 'textarea', value: e && e.note },
+      { name: 'files', label: 'Comprovantes', type: 'files', any: true, hint: 'Nota, recibo, comprovante de pagamento. Escolha arquivos ou arraste para esta janela.' },
+      e && me.is_admin && { name: 'settled', label: 'Já acertado', type: 'checkbox', value: !!e.settled_at },
+    ].filter(Boolean),
+    onSubmit: async ({ files, amount, ...v }) => {
+      v.amount_cents = parseMoney(amount);
+      const id = e ? e.id : (await api('POST', '/expenses', v)).id;
+      if (e) await api('PATCH', `/expenses/${id}`, v);
+      e = e || { id }; // se o anexo falhar, salvar de novo não duplica o lançamento
+      for (const f of files.splice(0)) {
+        if (f.size > MAX_FILE_BYTES) throw new Error(`"${f.name}" passa do limite de 50 MB.`);
+        await uploadFile(`/expenses/${id}/files`, f, (frac) => toast(`Enviando ${f.name} (${Math.round(frac * 100)}%)`));
+      }
+    },
+    onDelete: e ? () => api('DELETE', `/expenses/${e.id}`) : null,
+    deleteLabel: 'Excluir gasto',
+  });
+}
+
+function exportExpenses(list) {
+  const cell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const rows = [['Data', 'Descrição', 'Valor', 'Quem pagou', 'Observação', 'Situação', 'Anexos']];
+  for (const e of [...list].reverse()) {
+    rows.push([
+      e.date.split('-').reverse().join('/'),
+      e.description,
+      (e.amount_cents / 100).toFixed(2).replace('.', ','),
+      (userById(e.paid_by) || {}).name,
+      e.note,
+      e.settled_at ? 'Acertado' : 'Em aberto',
+      e.files.length,
+    ]);
+  }
+  const csv = `\ufeff${rows.map((r) => r.map(cell).join(';')).join('\r\n')}`;
+  const a = el('a', { href: URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' })), download: `conta-corrente-${today()}.csv` });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+function expenseRow(e) {
+  const payer = userById(e.paid_by);
+  const editable = canEditExpense(e);
+  const picker = el('input', { type: 'file', multiple: true, hidden: true, onchange: () => sendFiles(`/expenses/${e.id}/files`, picker.files) });
+  return el(
+    'li',
+    {
+      class: `expense${e.settled_at ? ' settled' : ''}`,
+      ondragover: (ev) => {
+        if (!editable || !hasFiles(ev)) return;
+        ev.preventDefault();
+        ev.currentTarget.classList.add('drop-here');
+      },
+      ondragleave: (ev) => {
+        if (!ev.currentTarget.contains(ev.relatedTarget)) ev.currentTarget.classList.remove('drop-here');
+      },
+      ondrop: (ev) => {
+        if (!editable || !hasFiles(ev)) return;
+        ev.preventDefault();
+        ev.currentTarget.classList.remove('drop-here');
+        sendFiles(`/expenses/${e.id}/files`, ev.dataTransfer.files);
+      },
+    },
+    el('span', { class: 'exp-date' }, fmtDate(e.date)),
+    el(
+      'div',
+      { class: 'exp-main' },
+      el('strong', null, e.description),
+      e.note && el('p', { class: 'note' }, e.note),
+      el(
+        'p',
+        { class: 'exp-meta hint' },
+        payer && el('span', { class: 'person' }, avatar(e.paid_by), payer.name),
+        e.settled_at && el('span', { class: 'tag' }, 'acertado'),
+        e.files.map((f) =>
+          el(
+            'span',
+            { class: 'attach' },
+            el('a', { href: `/api/expense-files/${f.id}`, target: '_blank', rel: 'noopener', title: fmtSize(f.size) }, `📎 ${f.name}`),
+            editable &&
+              el(
+                'button',
+                {
+                  class: 'linklike',
+                  type: 'button',
+                  'aria-label': `Remover anexo ${f.name}`,
+                  title: 'Remover anexo',
+                  onclick: () => confirm(`Remover o anexo "${f.name}"?`) && act(() => api('DELETE', `/expense-files/${f.id}`)),
+                },
+                '✕'
+              )
+          )
+        ),
+        editable && picker,
+        editable && el('button', { class: 'btn quiet small', type: 'button', onclick: () => picker.click() }, '+ Anexo')
+      )
+    ),
+    el('span', { class: 'exp-amount' }, money(e.amount_cents)),
+    editable
+      ? el('button', { class: 'icon', type: 'button', title: 'Editar gasto', 'aria-label': `Editar gasto ${e.description}`, onclick: () => expenseDialog(e) }, '⋯')
+      : el('span', { class: 'icon', 'aria-hidden': 'true' })
+  );
+}
+
+function ledgerView() {
+  const open = state.expenses.filter((e) => !e.settled_at);
+  const shown = showSettled ? state.expenses : open;
+  const total = open.reduce((n, e) => n + e.amount_cents, 0);
+  const byPerson = state.users
+    .map((u) => ({ u, sum: open.filter((e) => e.paid_by === u.id).reduce((n, e) => n + e.amount_cents, 0) }))
+    .filter((x) => x.u.active || x.sum > 0);
+  const settledCount = state.expenses.length - open.length;
+  const toggle = el('input', {
+    type: 'checkbox',
+    checked: showSettled,
+    onchange: () => {
+      showSettled = toggle.checked;
+      render();
+    },
+  });
+  return el(
+    'main',
+    { class: 'ledger' },
+    el(
+      'div',
+      { class: 'toolbar' },
+      el('button', { class: 'btn primary', type: 'button', onclick: () => expenseDialog(null) }, '+ Lançar gasto'),
+      settledCount > 0 && el('label', { class: 'check' }, toggle, `Mostrar acertados (${settledCount})`),
+      el('span', { class: 'spacer' }),
+      state.expenses.length > 0 && el('button', { class: 'btn', type: 'button', onclick: () => exportExpenses(shown) }, 'Exportar planilha'),
+      me.is_admin &&
+        open.length > 0 &&
+        el(
+          'button',
+          {
+            class: 'btn',
+            type: 'button',
+            onclick: () => {
+              if (!confirm(`Fechar o acerto de ${open.length} gasto(s), total de ${money(total)}?\n\nEles passam a constar como acertados e os saldos voltam a zero. Dá para reabrir um gasto depois, um por um.`)) return;
+              act(() => api('POST', '/expenses/settle', {}));
+            },
+          },
+          'Fechar acerto'
+        )
+    ),
+    el(
+      'section',
+      { class: 'balances', 'aria-label': 'Gastos em aberto por pessoa' },
+      byPerson.map(({ u, sum }) =>
+        el(
+          'div',
+          { class: 'balance' },
+          el('span', { class: 'person' }, avatar(u.id), u.name),
+          el('strong', null, money(sum)),
+          el('span', { class: 'hint' }, total ? `${Math.round((sum / total) * 100)}% do total` : 'nada em aberto')
+        )
+      ),
+      el('div', { class: 'balance total' }, el('span', null, 'Total em aberto'), el('strong', null, money(total)), el('span', { class: 'hint' }, `${open.length} gasto(s)`))
+    ),
+    shown.length === 0
+      ? el('p', { class: 'hint empty' }, 'Nenhum gasto em aberto. Lance aqui o que cada sócio pagou do próprio bolso nesta fase, com o comprovante, para o acerto na hora dos aportes.')
+      : el('ul', { class: 'expenses' }, shown.map(expenseRow))
   );
 }
 
@@ -2149,7 +2370,7 @@ function render() {
       'header',
       { class: 'top' },
       el('span', { class: 'brand' }, 'Obsoleta'),
-      el('nav', null, tab('tasks', 'Tarefas', '#tarefas'), tab('refs', 'Referências', '#referencias'), tab('files', 'Arquivos', '#arquivos'), me.is_admin && tab('people', 'Pessoas', '#pessoas')),
+      el('nav', null, tab('tasks', 'Tarefas', '#tarefas'), tab('refs', 'Referências', '#referencias'), tab('files', 'Arquivos', '#arquivos'), tab('ledger', 'Conta corrente', '#conta'), me.is_admin && tab('people', 'Pessoas', '#pessoas')),
       el('span', { class: 'spacer' }),
       el(
         'button',
@@ -2191,7 +2412,7 @@ function render() {
         'Sair'
       )
     ),
-    view === 'refs' ? refsView() : view === 'files' ? filesView() : view === 'people' ? peopleView() : tasksView()
+    view === 'refs' ? refsView() : view === 'files' ? filesView() : view === 'ledger' ? ledgerView() : view === 'people' ? peopleView() : tasksView()
   );
 
   const board = root.querySelector('.board');
