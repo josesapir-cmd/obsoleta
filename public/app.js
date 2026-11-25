@@ -1608,6 +1608,33 @@ function render() {
   }
 }
 
+// Clicar fora de uma janela (no fundo escurecido) fecha a janela. O clique precisa começar e
+// terminar fora, para que selecionar um texto e soltar o mouse do lado de fora não feche nada.
+// Se houver algo digitado e não salvo, pede confirmação antes de descartar.
+{
+  const outside = (dlg, e) => {
+    const r = dlg.getBoundingClientRect();
+    return e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom;
+  };
+  const unsaved = (dlg) =>
+    dlg.classList.contains('item') ? [...dlg.querySelectorAll('.composer textarea')].some((t) => t.value.trim()) : dlg.dataset.dirty === '1';
+  let downOutside = false;
+  document.addEventListener('input', (e) => {
+    const dlg = e.target.closest && e.target.closest('dialog');
+    if (dlg) dlg.dataset.dirty = '1';
+  });
+  document.addEventListener('pointerdown', (e) => {
+    downOutside = e.target instanceof HTMLDialogElement && outside(e.target, e);
+  });
+  document.addEventListener('click', (e) => {
+    const dlg = e.target;
+    if (!downOutside || !(dlg instanceof HTMLDialogElement) || !outside(dlg, e)) return;
+    downOutside = false;
+    if (unsaved(dlg) && !confirm('Fechar e descartar o que você digitou?')) return;
+    dlg.close();
+  });
+}
+
 // Soltar um arquivo fora de uma área de destino não deve fazer o navegador abrir o arquivo.
 for (const type of ['dragover', 'drop']) {
   window.addEventListener(type, (e) => {
