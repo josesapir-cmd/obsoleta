@@ -2,6 +2,7 @@
 
 const STATUS = { todo: 'A fazer', doing: 'Em andamento', done: 'Concluída' };
 const STATUS_NEXT = { todo: 'doing', doing: 'done', done: 'todo' };
+const REACTIONS = ['👍', '❤️', '😂', '😮', '🤔', '👎'];
 const COLORS = ['vinho', 'ambar', 'oliva', 'petroleo', 'azul', 'ameixa', 'grafite'];
 
 const root = document.getElementById('app');
@@ -282,8 +283,43 @@ function lightbox(ids, index) {
   const counter = el('span', { class: 'hint', 'aria-live': 'polite' });
   const openLink = el('a', { class: 'btn', target: '_blank', rel: 'noopener' }, 'Abrir em nova aba');
   const many = ids.length > 1;
+  const reactBar = el('div', { class: 'reactions', role: 'group', 'aria-label': 'Reações' });
+  const drawReactions = () => {
+    const mine = state.reactions[ids[i]] || {};
+    // Redesenhar troca os botões; devolve o foco ao mesmo emoji para não perder o teclado.
+    const focused = [...reactBar.children].indexOf(document.activeElement);
+    reactBar.replaceChildren(
+      ...REACTIONS.map((emoji) => {
+        const who = mine[emoji] || [];
+        const on = who.includes(me.id);
+        return el(
+          'button',
+          {
+            class: `react${on ? ' on' : ''}`,
+            type: 'button',
+            'aria-pressed': String(on),
+            title: who.length ? who.map((id) => (userById(id) || {}).name).filter(Boolean).join(', ') : 'Reagir',
+            onclick: async () => {
+              const imageId = ids[i];
+              try {
+                await api('POST', `/images/${imageId}/reactions`, { emoji });
+              } catch (e) {
+                toast(e.message);
+              }
+              await refresh(true);
+              if (ids[i] === imageId) drawReactions();
+            },
+          },
+          emoji,
+          who.length > 0 && el('span', null, String(who.length))
+        );
+      })
+    );
+    if (focused >= 0) reactBar.children[focused].focus();
+  };
   const show = (n) => {
     i = (n + ids.length) % ids.length;
+    drawReactions();
     img.src = `/api/images/${ids[i]}`;
     openLink.href = img.src;
     counter.textContent = many ? `${i + 1} de ${ids.length}` : '';
@@ -314,15 +350,9 @@ function lightbox(ids, index) {
 
   const dlg = el(
     'dialog',
-    {
-      class: 'modal lightbox',
-      onkeydown: (e) => {
-        if (!many || (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight')) return;
-        e.preventDefault();
-        show(i + (e.key === 'ArrowRight' ? 1 : -1));
-      },
-    },
+    { class: 'modal lightbox' },
     stage,
+    reactBar,
     el(
       'div',
       { class: 'modal-actions' },
@@ -349,7 +379,15 @@ function lightbox(ids, index) {
       el('button', { class: 'btn primary', type: 'button', onclick: () => dlg.close() }, 'Fechar')
     )
   );
+  // No documento, e não na janela: as setas funcionam onde quer que o foco esteja.
+  const onKey = (e) => {
+    if (!many || (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight')) return;
+    e.preventDefault();
+    show(i + (e.key === 'ArrowRight' ? 1 : -1));
+  };
+  document.addEventListener('keydown', onKey);
   dlg.addEventListener('close', () => {
+    document.removeEventListener('keydown', onKey);
     dlg.remove();
     refresh(true);
   });
@@ -476,7 +514,7 @@ function mentionSuggest(textarea) {
 
 // ---------- janela do item (leitura + comentários) ----------
 
-function itemDialog({ kind, id, title, details, onEdit }) {
+function itemDialog({ kind, id, title, details, onEdit, actions }) {
   const list = el('ol', { class: 'thread' });
   let shown = '';
   const load = async () => {
@@ -544,6 +582,7 @@ function itemDialog({ kind, id, title, details, onEdit }) {
       'header',
       { class: 'item-head' },
       el('h2', null, title),
+      actions && actions(() => dlg.close()),
       el('button', { class: 'btn', type: 'button', onclick: () => { dlg.close(); onEdit(); } }, 'Editar'),
       el('button', { class: 'icon', type: 'button', 'aria-label': 'Fechar', title: 'Fechar', onclick: () => dlg.close() }, '✕')
     ),
@@ -595,6 +634,23 @@ function taskView(t) {
     id: t.id,
     title: t.title,
     onEdit: () => taskDialog(t),
+    actions: (close) =>
+      el(
+        'button',
+        {
+          class: `btn${t.status === 'done' ? '' : ' done'}`,
+          type: 'button',
+          onclick: async () => {
+            try {
+              await api('PATCH', `/tasks/${t.id}`, { status: t.status === 'done' ? 'todo' : 'done' });
+            } catch (e) {
+              toast(e.message);
+            }
+            close();
+          },
+        },
+        t.status === 'done' ? 'Reabrir' : '✓ Concluir'
+      ),
     details: el(
       'div',
       { class: 'details' },
@@ -775,7 +831,23 @@ function card(t) {
         clearDropMarks();
       },
     },
-    el('button', { class: 'card-title', type: 'button', onclick: () => taskView(t) }, t.title),
+    el(
+      'div',
+      { class: 'card-top' },
+      el(
+        'button',
+        {
+          class: `check-btn${t.status === 'done' ? ' on' : ''}`,
+          type: 'button',
+          'aria-pressed': String(t.status === 'done'),
+          'aria-label': t.status === 'done' ? `Reabrir tarefa ${t.title}` : `Concluir tarefa ${t.title}`,
+          title: t.status === 'done' ? 'Reabrir tarefa' : 'Marcar como concluída',
+          onclick: () => act(() => api('PATCH', `/tasks/${t.id}`, { status: t.status === 'done' ? 'todo' : 'done' })),
+        },
+        '✓'
+      ),
+      el('button', { class: 'card-title', type: 'button', onclick: () => taskView(t) }, t.title)
+    ),
     el(
       'div',
       { class: 'card-meta' },
@@ -1011,6 +1083,14 @@ function linkPreview(r) {
   );
 }
 
+// Resumo das reações sobre a miniatura: os emojis usados e o total.
+function reactionBadge(imageId) {
+  const entries = Object.entries(state.reactions[imageId] || {});
+  if (!entries.length) return null;
+  const total = entries.reduce((n, [, who]) => n + who.length, 0);
+  return el('span', { class: 'thumb-reactions' }, `${entries.map(([emoji]) => emoji).slice(0, 3).join('')} ${total}`);
+}
+
 function refItem(r) {
   const safe = /^https?:\/\//i.test(r.url);
   const by = userById(r.created_by);
@@ -1053,7 +1133,7 @@ function refItem(r) {
         'div',
         { class: 'thumbs' },
         r.images.map((id, n) =>
-          el('button', { class: 'thumb', type: 'button', 'aria-label': 'Ampliar imagem', onclick: () => lightbox(r.images, n) }, el('img', { src: `/api/images/${id}`, alt: '', loading: 'lazy' }))
+          el('button', { class: 'thumb', type: 'button', 'aria-label': 'Ampliar imagem', onclick: () => lightbox(r.images, n) }, el('img', { src: `/api/images/${id}`, alt: '', loading: 'lazy' }), reactionBadge(id))
         )
       ),
     el(

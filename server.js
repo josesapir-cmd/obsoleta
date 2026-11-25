@@ -12,6 +12,7 @@ const MIN_PASSWORD = 10;
 const STATUSES = ['todo', 'doing', 'done'];
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_IMAGES_PER_REF = 30;
+const REACTIONS = ['👍', '❤️', '😂', '😮', '🤔', '👎'];
 const COLORS = ['vinho', 'ambar', 'oliva', 'petroleo', 'azul', 'ameixa', 'grafite'];
 
 class HttpError extends Error {
@@ -185,6 +186,12 @@ function createApp({ dbPath, uploadDir, production = false, admin, previewAllowP
       user_id INTEGER NOT NULL REFERENCES users(id),
       body TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS image_reactions (
+      image_id INTEGER NOT NULL REFERENCES ref_images(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      emoji TEXT NOT NULL,
+      PRIMARY KEY (image_id, user_id, emoji)
     );
     CREATE INDEX IF NOT EXISTS comments_target ON comments (kind, target_id);
     CREATE TABLE IF NOT EXISTS comment_mentions (
@@ -373,7 +380,13 @@ function createApp({ dbPath, uploadDir, production = false, admin, previewAllowP
     for (const r of q('SELECT kind, target_id, COUNT(*) AS n FROM comments GROUP BY kind, target_id').all()) {
       counts.set(`${r.kind}:${r.target_id}`, r.n);
     }
+    // { idDaImagem: { emoji: [idsDeQuemReagiu] } }
+    const reactions = {};
+    for (const r of q('SELECT image_id, emoji, user_id FROM image_reactions ORDER BY rowid').all()) {
+      ((reactions[r.image_id] ||= {})[r.emoji] ||= []).push(r.user_id);
+    }
     res.json({
+      reactions,
       mentions: q(
         `SELECT c.id AS comment_id, c.kind, c.target_id, c.user_id, c.body, c.created_at
          FROM comment_mentions m JOIN comments c ON c.id = m.comment_id
@@ -632,6 +645,17 @@ function createApp({ dbPath, uploadDir, production = false, admin, previewAllowP
     res.sendFile(img.filename, { root: uploadDir, headers: { 'Content-Type': img.mime } }, (err) => {
       if (err && !res.headersSent) res.status(404).json({ error: 'Imagem não encontrada.' });
     });
+  });
+
+  // Liga ou desliga a reação da própria pessoa.
+  api.post('/images/:id/reactions', (req, res) => {
+    const id = intId(req.params.id);
+    if (!q('SELECT id FROM ref_images WHERE id = ?').get(id)) throw new HttpError(404, 'Imagem não encontrada.');
+    const emoji = req.body.emoji;
+    if (!REACTIONS.includes(emoji)) bad('Reação inválida.');
+    const removed = q('DELETE FROM image_reactions WHERE image_id = ? AND user_id = ? AND emoji = ?').run(id, req.user.id, emoji).changes;
+    if (!removed) q('INSERT INTO image_reactions (image_id, user_id, emoji) VALUES (?, ?, ?)').run(id, req.user.id, emoji);
+    res.json({ on: !removed });
   });
 
   api.delete('/images/:id', (req, res) => {

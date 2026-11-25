@@ -169,6 +169,16 @@ test('referência guarda a prévia e aceita imagens', async () => {
   s = await (await call('GET', '/state')).json();
   assert.deepEqual(s.refs.find((r) => r.id === ref).images, [imgId]);
 
+  // reações: liga, desliga, recusa emoji fora da lista
+  const react = (emoji) => call('POST', `/images/${imgId}/reactions`, { emoji });
+  assert.deepEqual(await (await react('❤️')).json(), { on: true });
+  await react('👍');
+  assert.deepEqual(await (await react('👍')).json(), { on: false });
+  assert.equal((await react('💩')).status, 400);
+  assert.equal((await call('POST', '/images/99999/reactions', { emoji: '👍' })).status, 404);
+  s = await (await call('GET', '/state')).json();
+  assert.deepEqual(s.reactions, { [imgId]: { '❤️': [1] } });
+
   const got = await call('GET', `/images/${imgId}`);
   assert.equal(got.headers.get('content-type'), 'image/png');
   assert.deepEqual(Buffer.from(await got.arrayBuffer()), png);
@@ -179,6 +189,7 @@ test('referência guarda a prévia e aceita imagens', async () => {
   await new Promise((r) => setTimeout(r, 100));
   assert.equal(fs.readdirSync(uploadDir).length, 0);
   assert.equal((await call('GET', `/images/${imgId}`)).status, 404);
+  assert.deepEqual((await (await call('GET', '/state')).json()).reactions, {});
 });
 
 test('bloqueia após tentativas repetidas de login', async () => {
