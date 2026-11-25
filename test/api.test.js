@@ -237,3 +237,26 @@ test('comentários, menções e permissão de exclusão', async () => {
   assert.equal((await ana('GET', `/comments?kind=task&id=${task}`)).status, 404);
   assert.equal(caioFull > 0, true);
 });
+
+test('passkeys: desafio é emitido e respostas inválidas são recusadas', async () => {
+  const anon = client();
+  const opt = await anon('POST', '/passkeys/login/options', {});
+  assert.equal(opt.status, 200);
+  assert.equal(opt.body.options.rpId, '127.0.0.1');
+  assert.ok(opt.body.options.challenge.length > 20);
+  const fake = { id: 'abc', rawId: 'abc', type: 'public-key', response: {} };
+  assert.equal((await anon('POST', '/passkeys/login/verify', { flow: opt.body.flow, response: fake })).status, 401);
+  // o desafio vale uma vez só
+  assert.equal((await anon('POST', '/passkeys/login/verify', { flow: opt.body.flow, response: fake })).status, 400);
+  assert.equal((await anon('POST', '/passkeys/register/options', {})).status, 401);
+
+  const ana = client();
+  await ana('POST', '/login', { email: 'ana@example.com', password: cookieOf.password });
+  const reg = await ana('POST', '/passkeys/register/options', {});
+  assert.equal(reg.body.options.user.name, 'ana@example.com');
+  assert.equal((await ana('POST', '/passkeys/register/verify', { flow: reg.body.flow, response: fake })).status, 400);
+  // um desafio de login não serve para cadastrar
+  const other = await anon('POST', '/passkeys/login/options', {});
+  assert.equal((await ana('POST', '/passkeys/register/verify', { flow: other.body.flow, response: fake })).status, 400);
+  assert.deepEqual((await ana('GET', '/passkeys')).body, []);
+});

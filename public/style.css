@@ -444,6 +444,9 @@ main.tasks { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .mention-list button:hover { border-color: var(--muted); }
 .excerpt { display: block; margin-top: 3px; color: var(--muted); font-size: 14px; overflow-wrap: anywhere; }
 
+.passkey-list { display: flex; flex-direction: column; gap: 6px; }
+.passkey-list li:not(.hint) { display: flex; align-items: center; gap: 8px; border: 1px solid var(--line); background: var(--card); border-radius: 6px; padding: 8px 10px; flex-wrap: wrap; }
+
 /* ---------- pessoas ---------- */
 
 main.people { max-width: 680px; }

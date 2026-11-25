@@ -6,6 +6,12 @@ const fs = require('node:fs');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { fetchPreview } = require('./preview');
+const {
+  generateRegistrationOptions,
+  verifyRegistrationResponse,
+  generateAuthenticationOptions,
+  verifyAuthenticationResponse,
+} = require('@simplewebauthn/server');
 
 const SESSION_DAYS = 30;
 const MIN_PASSWORD = 10;
@@ -109,7 +115,7 @@ function imageType(buf) {
 
 // ---------- app ----------
 
-function createApp({ dbPath, uploadDir, production = false, admin, previewAllowPrivate = false } = {}) {
+function createApp({ dbPath, uploadDir, production = false, admin, previewAllowPrivate = false, appOrigin } = {}) {
   if (!uploadDir) throw new Error('uploadDir é obrigatório.');
   fs.mkdirSync(uploadDir, { recursive: true });
   const db = new DatabaseSync(dbPath);
@@ -186,6 +192,18 @@ function createApp({ dbPath, uploadDir, production = false, admin, previewAllowP
       user_id INTEGER NOT NULL REFERENCES users(id),
       body TEXT NOT NULL,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS passkeys (
+      id INTEGER PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      credential_id TEXT NOT NULL UNIQUE,
+      public_key BLOB NOT NULL,
+      counter INTEGER NOT NULL DEFAULT 0,
+      transports TEXT NOT NULL DEFAULT '',
+      name TEXT NOT NULL,
+      rp_id TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      last_used_at TEXT
     );
     CREATE TABLE IF NOT EXISTS image_reactions (
       image_id INTEGER NOT NULL REFERENCES ref_images(id) ON DELETE CASCADE,
@@ -299,6 +317,14 @@ function createApp({ dbPath, uploadDir, production = false, admin, previewAllowP
     };
   }
 
+  function startSession(res, user) {
+    const token = crypto.randomBytes(32).toString('hex');
+    const now = Date.now();
+    q('DELETE FROM sessions WHERE expires_at < ?').run(now);
+    q('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)').run(sha256(token), user.id, now + SESSION_DAYS * 86400000);
+    res.set('Set-Cookie', `sid=${token}; Max-Age=${SESSION_DAYS * 86400}; ${cookieOpts}`);
+  }
+
   const publicUser = (u) => ({ id: u.id, name: u.name, email: u.email, is_admin: !!u.is_admin });
 
   api.post('/login', (req, res) => {
@@ -311,15 +337,74 @@ function createApp({ dbPath, uploadDir, production = false, admin, previewAllowP
       fail();
       throw new HttpError(401, 'E-mail ou senha incorretos.');
     }
-    const token = crypto.randomBytes(32).toString('hex');
+    startSession(res, user);
+    res.json(publicUser(user));
+  });
+
+  // ---------- passkeys (WebAuthn) ----------
+
+  // A passkey vale para um domínio. Por padrão usamos o endereço pelo qual o app foi acessado;
+  // APP_ORIGIN fixa esse valor se o proxy do host não repassar o endereço corretamente.
+  function relyingParty(req) {
+    const origin = appOrigin || `${req.protocol}://${req.get('host')}`;
+    return { origin, rpID: new URL(origin).hostname };
+  }
+
+  const flows = new Map();
+  function newFlow(challenge, userId = null) {
     const now = Date.now();
-    q('DELETE FROM sessions WHERE expires_at < ?').run(now);
-    q('INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)').run(
-      sha256(token),
-      user.id,
-      now + SESSION_DAYS * 86400000
-    );
-    res.set('Set-Cookie', `sid=${token}; Max-Age=${SESSION_DAYS * 86400}; ${cookieOpts}`);
+    for (const [k, v] of flows) if (v.expires < now) flows.delete(k);
+    if (flows.size > 1000) throw new HttpError(429, 'Muitas tentativas. Aguarde alguns minutos e tente de novo.');
+    const id = crypto.randomBytes(16).toString('hex');
+    flows.set(id, { challenge, userId, expires: now + 5 * 60 * 1000 });
+    return id;
+  }
+  function takeFlow(id, userId = null) {
+    const flow = typeof id === 'string' ? flows.get(id) : null;
+    flows.delete(id);
+    if (!flow || flow.expires < Date.now() || flow.userId !== userId) bad('A solicitação expirou. Tente de novo.');
+    return flow;
+  }
+
+  api.post('/passkeys/login/options', async (req, res) => {
+    const { rpID } = relyingParty(req);
+    const options = await generateAuthenticationOptions({ rpID, userVerification: 'preferred' });
+    res.json({ flow: newFlow(options.challenge), options });
+  });
+
+  api.post('/passkeys/login/verify', async (req, res) => {
+    const fail = throttle(`passkey|${req.ip}`);
+    const flow = takeFlow(req.body.flow);
+    const { origin, rpID } = relyingParty(req);
+    const response = req.body.response;
+    const key = response && typeof response.id === 'string' ? q('SELECT * FROM passkeys WHERE credential_id = ?').get(response.id) : null;
+    const user = key && q('SELECT * FROM users WHERE id = ? AND active = 1').get(key.user_id);
+    let result = null;
+    if (user) {
+      try {
+        result = await verifyAuthenticationResponse({
+          response,
+          expectedChallenge: flow.challenge,
+          expectedOrigin: origin,
+          expectedRPID: rpID,
+          requireUserVerification: false,
+          credential: {
+            id: key.credential_id,
+            publicKey: new Uint8Array(key.public_key),
+            counter: key.counter,
+            transports: key.transports ? key.transports.split(',') : undefined,
+          },
+        });
+      } catch (e) {
+        console.warn(`Passkey recusada (${origin}): ${e.message}`);
+      }
+    }
+    if (!result || !result.verified) {
+      fail();
+      throw new HttpError(401, 'Não foi possível entrar com essa passkey.');
+    }
+    q("UPDATE passkeys SET counter = ?, last_used_at = datetime('now') WHERE id = ?").run(result.authenticationInfo.newCounter, key.id);
+    startSession(res, user);
     res.json(publicUser(user));
   });
 
@@ -360,6 +445,62 @@ function createApp({ dbPath, uploadDir, production = false, admin, previewAllowP
     const next = password(req.body.next);
     q('UPDATE users SET pass_hash = ? WHERE id = ?').run(hashPassword(next), req.user.id);
     q('DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?').run(req.user.id, req.sidHash);
+    res.json({ ok: true });
+  });
+
+  api.get('/passkeys', (req, res) => {
+    res.json(q('SELECT id, name, rp_id, created_at, last_used_at FROM passkeys WHERE user_id = ? ORDER BY id').all(req.user.id));
+  });
+
+  api.post('/passkeys/register/options', async (req, res) => {
+    const { rpID } = relyingParty(req);
+    const existing = q('SELECT credential_id, transports FROM passkeys WHERE user_id = ?').all(req.user.id);
+    if (existing.length >= 10) bad('Limite de 10 passkeys por pessoa. Remova alguma antes.');
+    const options = await generateRegistrationOptions({
+      rpName: 'Obsoleta',
+      rpID,
+      userName: req.user.email,
+      userDisplayName: req.user.name,
+      userID: new TextEncoder().encode(`u${req.user.id}`),
+      attestationType: 'none',
+      excludeCredentials: existing.map((k) => ({ id: k.credential_id, transports: k.transports ? k.transports.split(',') : undefined })),
+      authenticatorSelection: { residentKey: 'required', userVerification: 'preferred' },
+    });
+    res.json({ flow: newFlow(options.challenge, req.user.id), options });
+  });
+
+  api.post('/passkeys/register/verify', async (req, res) => {
+    const flow = takeFlow(req.body.flow, req.user.id);
+    const { origin, rpID } = relyingParty(req);
+    let result;
+    try {
+      result = await verifyRegistrationResponse({
+        response: req.body.response,
+        expectedChallenge: flow.challenge,
+        expectedOrigin: origin,
+        expectedRPID: rpID,
+        requireUserVerification: false,
+      });
+    } catch (e) {
+      console.warn(`Cadastro de passkey recusado (${origin}): ${e.message}`);
+      bad('Não foi possível cadastrar a passkey.');
+    }
+    if (!result.verified) bad('Não foi possível cadastrar a passkey.');
+    const cred = result.registrationInfo.credential;
+    q('INSERT INTO passkeys (user_id, credential_id, public_key, counter, transports, name, rp_id) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
+      req.user.id,
+      cred.id,
+      Buffer.from(cred.publicKey),
+      cred.counter,
+      (cred.transports || []).join(','),
+      text(req.body.name, 'Nome', 60) || 'Passkey',
+      rpID
+    );
+    res.status(201).json({ ok: true });
+  });
+
+  api.delete('/passkeys/:id', (req, res) => {
+    q('DELETE FROM passkeys WHERE id = ? AND user_id = ?').run(intId(req.params.id), req.user.id);
     res.json({ ok: true });
   });
 
@@ -741,7 +882,12 @@ function createApp({ dbPath, uploadDir, production = false, admin, previewAllowP
   // ---------- pessoas (admin) ----------
 
   api.get('/users', adminOnly, (req, res) => {
-    res.json(q('SELECT id, name, email, is_admin, active FROM users ORDER BY name COLLATE NOCASE').all());
+    res.json(
+      q(
+        `SELECT id, name, email, is_admin, active, (SELECT COUNT(*) FROM passkeys p WHERE p.user_id = users.id) AS passkeys
+         FROM users ORDER BY name COLLATE NOCASE`
+      ).all()
+    );
   });
 
   api.post('/users', adminOnly, (req, res) => {
@@ -784,6 +930,7 @@ function createApp({ dbPath, uploadDir, production = false, admin, previewAllowP
         id
       );
       if ((newPw && id !== req.user.id) || !active) q('DELETE FROM sessions WHERE user_id = ?').run(id);
+      if (b.clear_passkeys) q('DELETE FROM passkeys WHERE user_id = ?').run(id);
     });
     res.json({ ok: true });
   });
@@ -813,6 +960,7 @@ if (require.main === module) {
     dbPath: path.join(dataDir, 'obsoleta.db'),
     uploadDir: path.join(dataDir, 'uploads'),
     production: process.env.NODE_ENV === 'production',
+    appOrigin: process.env.APP_ORIGIN || undefined,
     admin: {
       name: process.env.ADMIN_NAME,
       email: process.env.ADMIN_EMAIL,

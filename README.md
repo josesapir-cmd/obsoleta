@@ -23,12 +23,19 @@ ADMIN_NAME="Seu Nome" ADMIN_EMAIL=voce@exemplo.com ADMIN_PASSWORD='uma-senha-lon
 
 Abra http://localhost:3000. As variáveis `ADMIN_*` só são lidas quando o banco está vazio (primeira execução); depois disso podem ser removidas.
 
+## Passkeys
+
+Cada pessoa cadastra as suas em **Conta → Cadastrar passkey neste aparelho** e passa a entrar com "Entrar com passkey". A senha continua valendo como alternativa.
+
+Uma passkey vale só para o domínio em que foi criada. Se o endereço do site mudar, as antigas deixam de funcionar: cada pessoa entra com senha, remove as antigas em Conta e cadastra de novo. Um admin pode remover as passkeys de alguém (aparelho perdido) em Pessoas → Editar.
+
 ## Variáveis de ambiente
 
 | Variável | Para quê |
 | --- | --- |
 | `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `ADMIN_NAME` | Criam o primeiro admin se o banco estiver vazio. Senha com 10+ caracteres. |
 | `DATA_DIR` | Pasta do banco (`obsoleta.db`) e das imagens (`uploads/`). Padrão: `./data`. |
+| `APP_ORIGIN` | Opcional. Endereço público completo (ex.: `https://meusite.com`). Só defina se as passkeys forem recusadas: por padrão o app usa o endereço pelo qual foi acessado. |
 | `PORT` | Porta HTTP. Padrão: 3000 (8080 no Docker). |
 | `NODE_ENV=production` | Liga cookie `Secure`, HSTS e confia em um proxy reverso. **Obrigatório na internet.** |
 

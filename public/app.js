@@ -39,7 +39,7 @@ async function api(method, url, body) {
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
-  if (res.status === 401 && url !== '/login') {
+  if (res.status === 401 && !url.endsWith('/login') && !url.includes('/login/')) {
     me = null;
     state = null;
     render();
@@ -1198,6 +1198,7 @@ function personDialog(u) {
       },
       !self && { name: 'is_admin', label: 'Pode gerenciar pessoas (admin)', type: 'checkbox', value: u && u.is_admin },
       u && !self && { name: 'active', label: 'Acesso ativo', type: 'checkbox', value: u.active },
+      u && u.passkeys > 0 && { name: 'clear_passkeys', label: `Remover as ${u.passkeys} passkey(s) desta pessoa (aparelho perdido)`, type: 'checkbox', value: false },
     ].filter(Boolean),
     onSubmit: (v) => {
       if (!v.password) delete v.password;
@@ -1229,6 +1230,169 @@ function peopleView() {
     ),
     el('p', { class: 'hint' }, 'Não há cadastro público: só quem está nesta lista, com acesso ativo, consegue entrar. Desativar alguém encerra as sessões dessa pessoa na hora.')
   );
+}
+
+// ---------- passkeys ----------
+
+const b64uToBuf = (str) => Uint8Array.from(atob(str.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
+const bufToB64u = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const passkeysSupported = () => !!(window.PublicKeyCredential && navigator.credentials);
+
+// Cancelar o aviso do sistema não é erro: devolve null.
+async function askAuthenticator(fn) {
+  try {
+    return await fn();
+  } catch (e) {
+    if (e.name === 'NotAllowedError' || e.name === 'AbortError') return null;
+    if (e.name === 'InvalidStateError') throw new Error('Este aparelho já tem uma passkey cadastrada para a sua conta.');
+    throw new Error('O aparelho não conseguiu usar a passkey.');
+  }
+}
+
+function deviceName() {
+  const ua = navigator.userAgent;
+  const names = [[/iPhone/, 'iPhone'], [/iPad/, 'iPad'], [/Android/, 'Android'], [/Mac OS X|Macintosh/, 'Mac'], [/Windows/, 'Windows'], [/Linux/, 'Linux']];
+  return (names.find(([re]) => re.test(ua)) || [null, 'Passkey'])[1];
+}
+
+async function registerPasskey() {
+  const { flow, options } = await api('POST', '/passkeys/register/options', {});
+  const cred = await askAuthenticator(() =>
+    navigator.credentials.create({
+      publicKey: {
+        ...options,
+        challenge: b64uToBuf(options.challenge),
+        user: { ...options.user, id: b64uToBuf(options.user.id) },
+        excludeCredentials: (options.excludeCredentials || []).map((c) => ({ ...c, id: b64uToBuf(c.id) })),
+      },
+    })
+  );
+  if (!cred) return false;
+  await api('POST', '/passkeys/register/verify', {
+    flow,
+    name: deviceName(),
+    response: {
+      id: cred.id,
+      rawId: bufToB64u(cred.rawId),
+      type: cred.type,
+      authenticatorAttachment: cred.authenticatorAttachment || undefined,
+      clientExtensionResults: cred.getClientExtensionResults(),
+      response: {
+        clientDataJSON: bufToB64u(cred.response.clientDataJSON),
+        attestationObject: bufToB64u(cred.response.attestationObject),
+        transports: cred.response.getTransports ? cred.response.getTransports() : undefined,
+      },
+    },
+  });
+  return true;
+}
+
+async function loginWithPasskey() {
+  const { flow, options } = await api('POST', '/passkeys/login/options', {});
+  const cred = await askAuthenticator(() =>
+    navigator.credentials.get({ publicKey: { ...options, challenge: b64uToBuf(options.challenge), allowCredentials: [] } })
+  );
+  if (!cred) return null;
+  return api('POST', '/passkeys/login/verify', {
+    flow,
+    response: {
+      id: cred.id,
+      rawId: bufToB64u(cred.rawId),
+      type: cred.type,
+      authenticatorAttachment: cred.authenticatorAttachment || undefined,
+      clientExtensionResults: cred.getClientExtensionResults(),
+      response: {
+        clientDataJSON: bufToB64u(cred.response.clientDataJSON),
+        authenticatorData: bufToB64u(cred.response.authenticatorData),
+        signature: bufToB64u(cred.response.signature),
+        userHandle: cred.response.userHandle ? bufToB64u(cred.response.userHandle) : undefined,
+      },
+    },
+  });
+}
+
+function accountDialog() {
+  const list = el('ul', { class: 'passkey-list' });
+  const err = el('p', { class: 'form-error', role: 'alert' });
+  const load = async () => {
+    const keys = await api('GET', '/passkeys').catch(() => []);
+    list.replaceChildren(
+      ...(keys.length
+        ? keys.map((k) =>
+            el(
+              'li',
+              null,
+              el(
+                'div',
+                null,
+                el('strong', null, k.name),
+                el(
+                  'p',
+                  { class: 'hint' },
+                  `Criada em ${fmtWhen(k.created_at)} · ${k.last_used_at ? `último uso em ${fmtWhen(k.last_used_at)}` : 'nunca usada'}`,
+                  k.rp_id !== location.hostname && ` · vale só em ${k.rp_id}`
+                )
+              ),
+              el('span', { class: 'spacer' }),
+              el(
+                'button',
+                {
+                  class: 'btn danger',
+                  type: 'button',
+                  onclick: async () => {
+                    if (!confirm(`Remover a passkey "${k.name}"? Esse aparelho deixa de entrar sem senha.`)) return;
+                    await api('DELETE', `/passkeys/${k.id}`).catch((e) => toast(e.message));
+                    load();
+                  },
+                },
+                'Remover'
+              )
+            )
+          )
+        : [el('li', { class: 'hint' }, 'Nenhuma passkey cadastrada. Você entra com e-mail e senha.')])
+    );
+  };
+  const add = el(
+    'button',
+    {
+      class: 'btn primary',
+      type: 'button',
+      onclick: async () => {
+        err.textContent = '';
+        add.disabled = true;
+        try {
+          if (await registerPasskey()) toast('Passkey cadastrada.');
+          await load();
+        } catch (e) {
+          err.textContent = e.message;
+        }
+        add.disabled = false;
+      },
+    },
+    'Cadastrar passkey neste aparelho'
+  );
+  const dlg = el(
+    'dialog',
+    { class: 'modal item' },
+    el(
+      'header',
+      { class: 'item-head' },
+      el('h2', null, 'Minha conta'),
+      el('button', { class: 'icon', type: 'button', 'aria-label': 'Fechar', title: 'Fechar', onclick: () => dlg.close() }, '✕')
+    ),
+    el('p', { class: 'hint' }, `${me.name} · ${me.email}`),
+    el('h3', null, 'Passkeys'),
+    el('p', { class: 'hint' }, 'Entre com a digital, o rosto ou o PIN do aparelho, sem digitar senha. A senha continua valendo como alternativa.'),
+    list,
+    err,
+    passkeysSupported() ? el('div', null, add) : el('p', { class: 'hint' }, 'Este navegador não oferece passkeys.'),
+    el('h3', null, 'Senha'),
+    el('div', null, el('button', { class: 'btn', type: 'button', onclick: () => { dlg.close(); passwordDialog(); } }, 'Alterar senha'))
+  );
+  dlg.addEventListener('close', () => dlg.remove());
+  document.body.append(dlg);
+  dlg.showModal();
+  load();
 }
 
 // ---------- casca ----------
@@ -1276,7 +1440,32 @@ function loginView() {
       el('div', { class: 'field' }, el('label', { for: 'l-email' }, 'E-mail'), mail),
       el('div', { class: 'field' }, el('label', { for: 'l-pw' }, 'Senha'), pw),
       err,
-      btn
+      btn,
+      passkeysSupported() &&
+        el(
+          'button',
+          {
+            class: 'btn',
+            type: 'button',
+            onclick: async (e) => {
+              err.textContent = '';
+              e.currentTarget.disabled = true;
+              const button = e.currentTarget;
+              try {
+                const user = await loginWithPasskey();
+                if (user) {
+                  me = user;
+                  await refresh(true);
+                  return;
+                }
+              } catch (ex) {
+                err.textContent = ex.message;
+              }
+              button.disabled = false;
+            },
+          },
+          'Entrar com passkey'
+        )
     )
   );
 }
@@ -1321,7 +1510,7 @@ function render() {
         state.mentions.length ? `@ ${state.mentions.length} ${state.mentions.length === 1 ? 'menção' : 'menções'}` : '@'
       ),
       el('span', { class: 'who' }, me.name),
-      el('button', { class: 'btn quiet', type: 'button', onclick: passwordDialog }, 'Senha'),
+      el('button', { class: 'btn quiet', type: 'button', onclick: accountDialog }, 'Conta'),
       el(
         'button',
         {
