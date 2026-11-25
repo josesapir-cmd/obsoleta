@@ -266,6 +266,11 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       last_used_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS task_deps (
+      task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      depends_on_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      PRIMARY KEY (task_id, depends_on_id)
+    );
     CREATE TABLE IF NOT EXISTS activity (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL REFERENCES users(id),
@@ -626,6 +631,11 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       if (!images.has(r.ref_id)) images.set(r.ref_id, []);
       images.get(r.ref_id).push(r.id);
     }
+    const deps = new Map();
+    for (const r of q('SELECT task_id, depends_on_id FROM task_deps ORDER BY depends_on_id').all()) {
+      if (!deps.has(r.task_id)) deps.set(r.task_id, []);
+      deps.get(r.task_id).push(r.depends_on_id);
+    }
     const counts = new Map();
     for (const r of q('SELECT kind, target_id, COUNT(*) AS n FROM comments GROUP BY kind, target_id').all()) {
       counts.set(`${r.kind}:${r.target_id}`, r.n);
@@ -650,7 +660,7 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
          FROM tasks ORDER BY position, id`
       )
         .all()
-        .map((t) => ({ ...t, assignees: assignees.get(t.id) || [], comments: counts.get(`task:${t.id}`) || 0 })),
+        .map((t) => ({ ...t, assignees: assignees.get(t.id) || [], depends_on: deps.get(t.id) || [], comments: counts.get(`task:${t.id}`) || 0 })),
       themes: q('SELECT id, name FROM themes ORDER BY position, id').all(),
       folders: q('SELECT id, name FROM folders ORDER BY position, id').all(),
       files: q('SELECT id, folder_id, name, size, uploaded_by, created_at FROM files ORDER BY name COLLATE NOCASE').all(),
@@ -759,6 +769,42 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
     ids.forEach((id, pos) => upd.run(categoryId, pos, id));
   }
 
+  const depIds = (taskId) => q('SELECT depends_on_id AS id FROM task_deps WHERE task_id = ? ORDER BY depends_on_id').all(taskId).map((r) => r.id);
+
+  // "A depende de B": recusa a própria tarefa e ciclos (B já depender de A, direta ou indiretamente).
+  function setDeps(taskId, list) {
+    if (!Array.isArray(list) || list.length > 50) bad('Dependências inválidas.');
+    const ids = [...new Set(list.map((v) => intId(v, 'Dependência')))];
+    for (const dep of ids) {
+      if (dep === taskId) bad('Uma tarefa não pode depender dela mesma.');
+      const row = q('SELECT title FROM tasks WHERE id = ?').get(dep);
+      if (!row) bad('Dependência inexistente.');
+      const seen = new Set();
+      const stack = [dep];
+      while (stack.length) {
+        const cur = stack.pop();
+        if (cur === taskId) bad(`Dependência circular: "${row.title}" já depende desta tarefa.`);
+        if (seen.has(cur)) continue;
+        seen.add(cur);
+        stack.push(...depIds(cur));
+      }
+    }
+    q('DELETE FROM task_deps WHERE task_id = ?').run(taskId);
+    for (const dep of ids) q('INSERT INTO task_deps (task_id, depends_on_id) VALUES (?, ?)').run(taskId, dep);
+  }
+
+  // Tarefas que estavam esperando só por esta e ficam liberadas quando ela é concluída.
+  function unblockedBy(taskId) {
+    return q(
+      `SELECT t.title FROM task_deps d JOIN tasks t ON t.id = d.task_id
+       WHERE d.depends_on_id = ? AND t.status <> 'done' AND NOT EXISTS (
+         SELECT 1 FROM task_deps o JOIN tasks b ON b.id = o.depends_on_id
+         WHERE o.task_id = d.task_id AND b.status <> 'done')`
+    )
+      .all(taskId)
+      .map((t) => t.title);
+  }
+
   const assigneeNames = (taskId) =>
     q('SELECT u.name FROM task_assignees a JOIN users u ON u.id = a.user_id WHERE a.task_id = ? ORDER BY u.name COLLATE NOCASE')
       .all(taskId)
@@ -786,6 +832,7 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
         ).lastInsertRowid
       );
       if ('assignees' in b) setAssignees(newId, b.assignees);
+      if ('depends_on' in b) setDeps(newId, b.depends_on);
       placeTask(newId, categoryId, null);
       log(req, 'criou a tarefa', 'tasks', newId, text(b.title, 'Título', 200, true), assigneeNames(newId));
       return newId;
@@ -810,7 +857,9 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
         id
       );
       const before = assigneeNames(id);
+      const depsBefore = depIds(id).join();
       if ('assignees' in b) setAssignees(id, b.assignees);
+      if ('depends_on' in b) setDeps(id, b.depends_on);
       const categoryId = 'category_id' in b ? intId(b.category_id, 'Categoria') : t.category_id;
       if ('before_id' in b) {
         placeTask(id, categoryId, b.before_id == null ? null : intId(b.before_id));
@@ -819,9 +868,16 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       }
       const now = q('SELECT * FROM tasks WHERE id = ?').get(id);
       if (now.status !== t.status) {
-        if (now.status === 'done') log(req, 'concluiu a tarefa', 'tasks', id, now.title);
+        if (now.status === 'done') {
+          const freed = unblockedBy(id);
+          log(req, 'concluiu a tarefa', 'tasks', id, now.title, freed.length ? `Liberou: ${freed.join(', ')}` : '');
+        }
         else if (t.status === 'done') log(req, 'reabriu a tarefa', 'tasks', id, now.title);
         else log(req, 'mudou a situação da tarefa', 'tasks', id, now.title, STATUS_LABEL[now.status]);
+      }
+      if (depIds(id).join() !== depsBefore) {
+        const names = depIds(id).map((d) => q('SELECT title FROM tasks WHERE id = ?').get(d).title);
+        log(req, 'alterou as dependências da tarefa', 'tasks', id, now.title, names.length ? `Depende de: ${names.join(', ')}` : 'Sem dependências');
       }
       const after = assigneeNames(id);
       if (after !== before) log(req, 'alterou os responsáveis da tarefa', 'tasks', id, now.title, after || 'Sem responsável');

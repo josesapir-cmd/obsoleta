@@ -371,3 +371,38 @@ test('novidades: registra o que os outros fizeram e marca como visto', async () 
   assert.equal((await ana('GET', '/state')).body.activity_unread, 0);
   assert.ok((await ana('GET', '/activity')).body.every((a) => !a.unread));
 });
+
+test('dependências entre tarefas: sem ciclos, e concluir avisa o que liberou', async () => {
+  const ana = client();
+  await ana('POST', '/login', { email: 'ana@example.com', password: cookieOf.password });
+  const dora = client();
+  await dora('POST', '/login', { email: 'dora@example.com', password: 'senha-da-dora-123' });
+  await dora('POST', '/activity/seen', {});
+  const cat = (await ana('POST', '/categories', { name: 'Abertura' })).body.id;
+  const mk = async (title) => (await ana('POST', '/tasks', { category_id: cat, title })).body.id;
+  const contrato = await mk('Contrato social');
+  const cnpj = await mk('Abrir CNPJ');
+  const conta = await mk('Abrir conta PJ');
+
+  assert.equal((await ana('PATCH', `/tasks/${cnpj}`, { depends_on: [contrato] })).status, 200);
+  assert.equal((await ana('PATCH', `/tasks/${conta}`, { depends_on: [cnpj] })).status, 200);
+  assert.equal((await ana('PATCH', `/tasks/${cnpj}`, { depends_on: [cnpj] })).status, 400);
+  assert.equal((await ana('PATCH', `/tasks/${cnpj}`, { depends_on: [99999] })).status, 400);
+  // ciclo indireto: contrato -> conta -> cnpj -> contrato
+  const cyc = await ana('PATCH', `/tasks/${contrato}`, { depends_on: [conta] });
+  assert.equal(cyc.status, 400);
+  assert.match(cyc.body.error, /circular/);
+
+  const s = (await ana('GET', '/state')).body;
+  assert.deepEqual(s.tasks.find((t) => t.id === cnpj).depends_on, [contrato]);
+  assert.deepEqual(s.tasks.find((t) => t.id === contrato).depends_on, []);
+
+  await ana('PATCH', `/tasks/${contrato}`, { status: 'done' });
+  const feed = (await dora('GET', '/activity')).body;
+  assert.equal(feed[0].text, 'concluiu a tarefa');
+  assert.equal(feed[0].detail, 'Liberou: Abrir CNPJ');
+
+  // excluir uma tarefa remove as dependências ligadas a ela
+  await ana('DELETE', `/tasks/${cnpj}`);
+  assert.deepEqual((await ana('GET', '/state')).body.tasks.find((t) => t.id === conta).depends_on, []);
+});

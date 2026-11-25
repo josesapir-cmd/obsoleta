@@ -634,7 +634,7 @@ function itemDialog({ kind, id, title, details, onEdit, actions }) {
       el('button', { class: 'btn', type: 'button', onclick: () => { dlg.close(); onEdit(); } }, 'Editar'),
       el('button', { class: 'icon', type: 'button', 'aria-label': 'Fechar', title: 'Fechar', onclick: () => dlg.close() }, '✕')
     ),
-    details,
+    typeof details === 'function' ? details(() => dlg.close()) : details,
     el('h3', null, 'Comentários'),
     list,
     el(
@@ -674,6 +674,39 @@ function itemDialog({ kind, id, title, details, onEdit, actions }) {
   api('POST', '/comments/seen', { kind, id }).catch(() => {});
 }
 
+function depList(label, tasks, close) {
+  if (!tasks.length) return null;
+  return el(
+    'div',
+    { class: 'deps' },
+    el('h3', null, label),
+    el(
+      'ul',
+      null,
+      tasks.map((d) =>
+        el(
+          'li',
+          null,
+          el(
+            'button',
+            {
+              type: 'button',
+              class: d.status === 'done' ? 'done' : '',
+              onclick: () => {
+                close();
+                taskView(d);
+              },
+            },
+            el('span', { class: 'mark', 'aria-hidden': 'true' }, d.status === 'done' ? '✓' : '○'),
+            el('span', { class: 'dep-title' }, d.title),
+            el('span', { class: 'hint' }, STATUS[d.status])
+          )
+        )
+      )
+    )
+  );
+}
+
 function taskView(t) {
   const cat = state.categories.find((c) => c.id === t.category_id);
   const overdue = t.due_date && t.status !== 'done' && t.due_date < today();
@@ -690,7 +723,7 @@ function taskView(t) {
           type: 'button',
           onclick: async () => {
             try {
-              await api('PATCH', `/tasks/${t.id}`, { status: t.status === 'done' ? 'todo' : 'done' });
+              if (!(await setStatus(t, t.status === 'done' ? 'todo' : 'done'))) return;
             } catch (e) {
               toast(e.message);
             }
@@ -699,7 +732,7 @@ function taskView(t) {
         },
         t.status === 'done' ? 'Reabrir' : '✓ Concluir'
       ),
-    details: el(
+    details: (close) => el(
       'div',
       { class: 'details' },
       el(
@@ -707,7 +740,8 @@ function taskView(t) {
         { class: 'chips' },
         cat && el('span', { class: `chip c-${cat.color}` }, cat.name),
         el('span', { class: `pill s-${t.status}` }, STATUS[t.status]),
-        t.due_date && el('span', { class: `due${overdue ? ' overdue' : ''}` }, `Prazo: ${fmtDate(t.due_date)}${overdue ? ' (atrasada)' : ''}`)
+        t.due_date && el('span', { class: `due${overdue ? ' overdue' : ''}` }, `Prazo: ${fmtDate(t.due_date)}${overdue ? ' (atrasada)' : ''}`),
+        t.status !== 'done' && blockers(t).length > 0 && el('span', { class: 'blocked' }, '🔒 Bloqueada')
       ),
       el(
         'p',
@@ -716,7 +750,9 @@ function taskView(t) {
           ? t.assignees.map((id) => userById(id) && el('span', { class: 'person' }, avatar(id), userById(id).name))
           : el('span', { class: 'hint' }, 'Sem responsável')
       ),
-      t.description ? el('p', { class: 'rich' }, richText(t.description)) : el('p', { class: 'hint' }, 'Sem descrição.')
+      t.description ? el('p', { class: 'rich' }, richText(t.description)) : el('p', { class: 'hint' }, 'Sem descrição.'),
+      depList('Depende de', t.depends_on.map(taskById).filter(Boolean), close),
+      depList('Libera ao ser concluída', dependents(t), close)
     ),
   });
 }
@@ -906,6 +942,22 @@ async function refresh(force = false) {
 
 // ---------- tarefas ----------
 
+const taskById = (id) => state.tasks.find((t) => t.id === id);
+// Dependências ainda não concluídas: enquanto houver alguma, a tarefa está bloqueada.
+const blockers = (t) => t.depends_on.map(taskById).filter((d) => d && d.status !== 'done');
+const dependents = (t) => state.tasks.filter((o) => o.depends_on.includes(t.id));
+
+// Muda a situação; ao concluir uma tarefa bloqueada, avisa antes (não impede).
+async function setStatus(t, next) {
+  const open = blockers(t);
+  if (next === 'done' && open.length) {
+    const names = open.map((d) => `“${d.title}”`).join(', ');
+    if (!confirm(`Esta tarefa depende de ${names}, que ainda não ${open.length > 1 ? 'foram concluídas' : 'foi concluída'}. Concluir mesmo assim?`)) return false;
+  }
+  await api('PATCH', `/tasks/${t.id}`, { status: next });
+  return true;
+}
+
 function visibleTasks(categoryId) {
   return state.tasks.filter(
     (t) =>
@@ -926,7 +978,16 @@ function taskDialog(task) {
       { name: 'status', label: 'Situação', type: 'select', value: task.status, options: Object.entries(STATUS) },
       { name: 'due_date', label: 'Prazo', type: 'date', value: task.due_date },
       { name: 'assignees', label: 'Responsáveis', type: 'checks', value: task.assignees, options: activeOrAssigned.map((u) => [u.id, u.name]) },
-    ],
+      state.tasks.length > 1 && {
+        name: 'depends_on',
+        label: 'Depende de (precisa estar concluída antes)',
+        type: 'checks',
+        value: task.depends_on,
+        options: state.categories.flatMap((c) =>
+          state.tasks.filter((o) => o.category_id === c.id && o.id !== task.id).map((o) => [o.id, `${o.title} · ${c.name}${o.status === 'done' ? ' ✓' : ''}`])
+        ),
+      },
+    ].filter(Boolean),
     onSubmit: (v) => (task.id ? api('PATCH', `/tasks/${task.id}`, v) : api('POST', '/tasks', v)),
     onDelete: task.id ? () => api('DELETE', `/tasks/${task.id}`) : null,
     deleteLabel: 'Excluir tarefa',
@@ -960,11 +1021,12 @@ function categoryDialog(cat) {
 }
 
 function card(t) {
+  const waiting = t.status === 'done' ? [] : blockers(t);
   const overdue = t.due_date && t.status !== 'done' && t.due_date < today();
   return el(
     'li',
     {
-      class: `card s-${t.status}`,
+      class: `card s-${t.status}${waiting.length ? ' is-blocked' : ''}`,
       draggable: true,
       'data-id': t.id,
       ondragstart: (e) => {
@@ -990,12 +1052,14 @@ function card(t) {
           'aria-pressed': String(t.status === 'done'),
           'aria-label': t.status === 'done' ? `Reabrir tarefa ${t.title}` : `Concluir tarefa ${t.title}`,
           title: t.status === 'done' ? 'Reabrir tarefa' : 'Marcar como concluída',
-          onclick: () => act(() => api('PATCH', `/tasks/${t.id}`, { status: t.status === 'done' ? 'todo' : 'done' })),
+          onclick: () => act(() => setStatus(t, t.status === 'done' ? 'todo' : 'done')),
         },
         '✓'
       ),
       el('button', { class: 'card-title', type: 'button', onclick: () => taskView(t) }, t.title)
     ),
+    waiting.length > 0 &&
+      el('p', { class: 'blocked', title: waiting.map((d) => d.title).join(', ') }, `🔒 Depende de: ${waiting[0].title}${waiting.length > 1 ? ` e mais ${waiting.length - 1}` : ''}`),
     el(
       'div',
       { class: 'card-meta' },
@@ -1005,7 +1069,7 @@ function card(t) {
           class: `pill s-${t.status}`,
           type: 'button',
           title: 'Clique para avançar a situação',
-          onclick: () => act(() => api('PATCH', `/tasks/${t.id}`, { status: STATUS_NEXT[t.status] })),
+          onclick: () => act(() => setStatus(t, STATUS_NEXT[t.status])),
         },
         STATUS[t.status]
       ),
