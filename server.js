@@ -936,7 +936,19 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
         placeTask(id, categoryId, null);
       }
       const now = q('SELECT * FROM tasks WHERE id = ?').get(id);
-      if (now.status !== t.status) {
+      // Concluir e reabrir em seguida (ou o contrário) é um engano desfeito: em vez de registrar
+      // duas novidades, a primeira é retirada.
+      const opposite = now.status === 'done' ? 'reabriu a tarefa' : t.status === 'done' ? 'concluiu a tarefa' : null;
+      const justDid =
+        now.status !== t.status &&
+        opposite &&
+        q(
+          `SELECT id, text FROM activity WHERE kind = 'tasks' AND target_id = ? AND user_id = ?
+           AND created_at > datetime('now', '-2 minutes') ORDER BY id DESC LIMIT 1`
+        ).get(id, req.user.id);
+      if (justDid && justDid.text === opposite) {
+        q('DELETE FROM activity WHERE id = ?').run(justDid.id);
+      } else if (now.status !== t.status) {
         if (now.status === 'done') {
           const freed = unblockedBy(id);
           log(req, 'concluiu a tarefa', 'tasks', id, now.title, freed.length ? `Liberou: ${freed.join(', ')}` : '');

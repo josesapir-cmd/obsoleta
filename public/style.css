@@ -193,7 +193,7 @@ main.tasks { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .card.dragging { opacity: 0.4; }
 .card.drop-before { box-shadow: 0 -3px 0 var(--accent); }
 .card.s-done .card-title { color: var(--muted); text-decoration: line-through; }
-.card-top { display: flex; align-items: flex-start; gap: 8px; }
+.card-top { display: flex; align-items: flex-start; gap: 10px; }
 .card-top .card-title { flex: 1; }
 .check-btn {
   flex: none;
@@ -210,7 +210,8 @@ main.tasks { flex: 1; display: flex; flex-direction: column; min-height: 0; }
   cursor: pointer;
   position: relative;
 }
-.check-btn::after { content: ''; position: absolute; inset: -9px; } /* área de toque maior */
+/* Área de toque um pouco maior, mas só para fora do cartão: nunca por cima do título. */
+.check-btn::after { content: ''; position: absolute; inset: -6px 0 -4px -8px; }
 .check-btn:hover { border-color: #4f7a3a; color: #4f7a3a; }
 .check-btn.on { background: #4f7a3a; border-color: #4f7a3a; color: #fff; }
 .btn.done { border-color: #4f7a3a; color: #3d6229; font-weight: 600; }
@@ -645,6 +646,9 @@ main.people > .hint { padding: 0 16px 24px; }
   max-width: calc(100vw - 32px);
 }
 #toast.show { opacity: 1; transform: translate(-50%, 0); }
+#toast.show.has-action { pointer-events: auto; display: flex; align-items: center; gap: 12px; }
+#toast button { border: 1px solid currentColor; background: none; color: inherit; border-radius: 6px; padding: 3px 10px; font-weight: 600; cursor: pointer; flex: none; }
+.pill:disabled { cursor: default; opacity: 1; }
 
 @media (max-width: 560px) {
   .who, .composer .hint { display: none; }

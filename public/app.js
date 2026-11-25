@@ -1,7 +1,6 @@
 'use strict';
 
 const STATUS = { todo: 'A fazer', doing: 'Em andamento', done: 'Concluída' };
-const STATUS_NEXT = { todo: 'doing', doing: 'done', done: 'todo' };
 const REACTIONS = ['👍', '❤️', '😂', '😮', '🤔', '👎'];
 const COLORS = ['vinho', 'ambar', 'oliva', 'petroleo', 'azul', 'ameixa', 'grafite'];
 
@@ -65,12 +64,30 @@ async function api(method, url, body) {
 }
 
 let toastTimer;
-function toast(msg) {
+// Aviso no rodapé. Com `action` ({ label, run }), ganha um botão e fica mais tempo na tela.
+function toast(msg, action) {
   const t = document.getElementById('toast');
-  t.textContent = msg;
+  const hide = () => t.classList.remove('show', 'has-action');
+  t.replaceChildren(
+    msg,
+    action
+      ? el(
+          'button',
+          {
+            type: 'button',
+            onclick: () => {
+              hide();
+              action.run();
+            },
+          },
+          action.label
+        )
+      : ''
+  );
   t.classList.add('show');
+  t.classList.toggle('has-action', !!action);
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.remove('show'), 4000);
+  toastTimer = setTimeout(hide, action ? 8000 : 4000);
 }
 
 // Executa uma ação rápida (sem diálogo) e atualiza a tela.
@@ -1368,7 +1385,21 @@ function card(t) {
           'aria-pressed': String(t.status === 'done'),
           'aria-label': t.status === 'done' ? `Reabrir tarefa ${t.title}` : `Concluir tarefa ${t.title}`,
           title: t.status === 'done' ? 'Reabrir tarefa' : 'Marcar como concluída',
-          onclick: () => act(() => setStatus(t, t.status === 'done' ? 'todo' : 'done')),
+          onclick: async () => {
+            // Reabrir é raro e costuma ser engano: pede confirmação. Concluir é direto, com "Desfazer".
+            if (t.status === 'done') {
+              if (!confirm(`Reabrir a tarefa “${t.title}”? Ela volta para “A fazer”.`)) return;
+              return act(() => setStatus(t, 'todo'));
+            }
+            const previous = t.status;
+            let done = false;
+            await act(async () => {
+              done = await setStatus(t, 'done');
+            });
+            if (done) {
+              toast(`Concluída: ${t.title}`, { label: 'Desfazer', run: () => act(() => api('PATCH', `/tasks/${t.id}`, { status: previous })) });
+            }
+          },
         },
         '✓'
       ),
@@ -1384,8 +1415,10 @@ function card(t) {
         {
           class: `pill s-${t.status}`,
           type: 'button',
-          title: 'Clique para avançar a situação',
-          onclick: () => act(() => setStatus(t, STATUS_NEXT[t.status])),
+          // A etiqueta só alterna entre "A fazer" e "Em andamento"; concluir e reabrir são pelo círculo.
+          disabled: t.status === 'done',
+          title: t.status === 'done' ? null : t.status === 'todo' ? 'Marcar como em andamento' : 'Voltar para a fazer',
+          onclick: () => act(() => setStatus(t, t.status === 'todo' ? 'doing' : 'todo')),
         },
         STATUS[t.status]
       ),

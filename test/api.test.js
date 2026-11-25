@@ -493,3 +493,21 @@ test('conta corrente: lançar, permissões, anexos e acerto', async () => {
   assert.equal((await dora('DELETE', `/expenses/${e1}`)).status, 200);
   assert.equal((await fetch(`${base}/expense-files/${fileId}`, { headers: { cookie: caio.cookie() } })).status, 404);
 });
+
+test('concluir e desfazer em seguida não deixa rastro nas novidades', async () => {
+  const ana = client();
+  await ana('POST', '/login', { email: 'ana@example.com', password: cookieOf.password });
+  const dora = client();
+  await dora('POST', '/login', { email: 'dora@example.com', password: 'senha-da-dora-123' });
+  const cat = (await ana('POST', '/categories', { name: 'Enganos' })).body.id;
+  const task = (await ana('POST', '/tasks', { category_id: cat, title: 'Limpeza do subsolo' })).body.id;
+  await dora('POST', '/activity/seen', {});
+  await ana('PATCH', `/tasks/${task}`, { status: 'done' });
+  assert.equal((await dora('GET', '/state')).body.activity_unread, 1);
+  await ana('PATCH', `/tasks/${task}`, { status: 'todo' });
+  assert.equal((await dora('GET', '/state')).body.activity_unread, 0);
+  assert.ok(!(await dora('GET', '/activity')).body.some((a) => a.target_id === task && /concluiu|reabriu/.test(a.text)));
+  // uma conclusão de verdade continua aparecendo
+  await ana('PATCH', `/tasks/${task}`, { status: 'done' });
+  assert.equal((await dora('GET', '/activity')).body[0].text, 'concluiu a tarefa');
+});
