@@ -6,6 +6,7 @@ Quadro de tarefas e área de referências dos sócios da livraria.
 - **Referências**: links, anotações e imagens agrupados por tema. Links ganham uma prévia (título, descrição e imagem da página); publicações públicas do Instagram podem ser abertas ali mesmo. Ao ampliar uma imagem dá para reagir com emojis e navegar entre as imagens da referência. Imagens são anexadas pelo botão "+ Imagem", pelo formulário ou arrastando arquivos sobre a referência.
 - **Arquivos**: repositório de documentos (contratos, documentos dos sócios) organizado em pastas. Até 50 MB por arquivo; envio pelo botão ou arrastando para a pasta. PDFs, imagens e `.txt` abrem no navegador, o resto é baixado. Só quem está logado acessa.
 - **Comentários**: clicar numa tarefa abre a janela de leitura com a descrição e a conversa; o botão "Editar" fica no canto superior direito. Referências têm a mesma conversa. Digitar `@` sugere pessoas; quem é marcado vê um aviso "@ menções" no topo ao abrir o sistema (não há envio de e-mail).
+- **Novidades (sininho)**: lista o que os outros fizeram desde a sua última visita — tarefas criadas, concluídas, movidas ou reatribuídas, referências, imagens, arquivos, comentários, novas pastas/temas/categorias e pessoas. Reações e reordenações não entram. Guarda as últimas 2.000 ações.
 - **Pessoas**: não existe cadastro público. Só um admin cria, edita e desativa contas.
 
 Um único processo Node com banco SQLite em arquivo. Sem serviços externos.

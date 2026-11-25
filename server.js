@@ -266,6 +266,16 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       last_used_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS activity (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      text TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      target_id INTEGER,
+      title TEXT NOT NULL DEFAULT '',
+      detail TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
     CREATE TABLE IF NOT EXISTS comment_reactions (
       comment_id INTEGER NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
       user_id INTEGER NOT NULL REFERENCES users(id),
@@ -287,6 +297,11 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
     );
   `);
 
+  // Migração: até qual novidade cada pessoa já viu.
+  if (!db.prepare('PRAGMA table_info(users)').all().some((c) => c.name === 'activity_seen')) {
+    db.exec('ALTER TABLE users ADD COLUMN activity_seen INTEGER NOT NULL DEFAULT 0');
+  }
+
   // Migração: colunas da prévia de link, acrescentadas depois da primeira versão.
   const refCols = db.prepare('PRAGMA table_info(refs)').all().map((c) => c.name);
   for (const col of ['preview_title', 'preview_desc', 'preview_image', 'preview_site']) {
@@ -305,6 +320,33 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       throw e;
     }
   };
+
+  // Registro de novidades (o sininho). Ações repetidas da mesma pessoa sobre o mesmo item
+  // em poucos minutos (várias imagens, edições seguidas) contam uma vez só.
+  function log(req, what, kind, targetId, title, detail = '') {
+    const last = q('SELECT * FROM activity ORDER BY id DESC LIMIT 1').get();
+    if (
+      last &&
+      last.user_id === req.user.id &&
+      last.text === what &&
+      last.kind === kind &&
+      last.target_id === (targetId ?? null) &&
+      last.detail === detail &&
+      Date.parse(`${last.created_at.replace(' ', 'T')}Z`) > Date.now() - 10 * 60 * 1000
+    ) {
+      return;
+    }
+    const r = q('INSERT INTO activity (user_id, text, kind, target_id, title, detail) VALUES (?, ?, ?, ?, ?, ?)').run(
+      req.user.id,
+      what,
+      kind,
+      targetId ?? null,
+      title,
+      detail
+    );
+    if (Number(r.lastInsertRowid) % 200 === 0) q('DELETE FROM activity WHERE id <= ?').run(Number(r.lastInsertRowid) - 2000);
+  }
+  const STATUS_LABEL = { todo: 'A fazer', doing: 'Em andamento', done: 'Concluída' };
 
   // Primeiro acesso: cria o administrador a partir das variáveis de ambiente.
   if (q('SELECT COUNT(*) AS n FROM users').get().n === 0) {
@@ -594,6 +636,7 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       ((reactions[r.image_id] ||= {})[r.emoji] ||= []).push(r.user_id);
     }
     res.json({
+      activity_unread: q('SELECT COUNT(*) AS n FROM activity WHERE id > ? AND user_id <> ?').get(req.user.activity_seen, req.user.id).n,
       reactions,
       mentions: q(
         `SELECT c.id AS comment_id, c.kind, c.target_id, c.user_id, c.body, c.created_at
@@ -620,9 +663,24 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
     });
   });
 
+  api.get('/activity', (req, res) => {
+    res.json(
+      q('SELECT id, user_id, text, kind, target_id, title, detail, created_at FROM activity WHERE user_id <> ? ORDER BY id DESC LIMIT 100')
+        .all(req.user.id)
+        .map((a) => ({ ...a, unread: a.id > req.user.activity_seen }))
+    );
+  });
+
+  api.post('/activity/seen', (req, res) => {
+    const max = q('SELECT COALESCE(MAX(id), 0) AS id FROM activity').get().id;
+    const upTo = Number.isSafeInteger(req.body.id) ? Math.min(req.body.id, max) : max;
+    q('UPDATE users SET activity_seen = MAX(activity_seen, ?) WHERE id = ?').run(upTo, req.user.id);
+    res.json({ ok: true });
+  });
+
   // ---------- listas ordenadas (categorias e temas) ----------
 
-  function orderedList(route, table, childTable, childFk, label, extra) {
+  function orderedList(route, table, childTable, childFk, label, extra, created) {
     const reorder = (id, index) => {
       const ids = q(`SELECT id FROM ${table} WHERE id <> ? ORDER BY position, id`)
         .all(id)
@@ -639,6 +697,7 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
         const newId = Number(q(`INSERT INTO ${table} (name) VALUES (?)`).run(name).lastInsertRowid);
         if (extra) extra(newId, req.body);
         reorder(newId, null);
+        log(req, created, table, newId, name);
         return newId;
       });
       res.status(201).json({ id });
@@ -672,9 +731,9 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       if (!COLORS.includes(body.color)) bad('Cor inválida.');
       q('UPDATE categories SET color = ? WHERE id = ?').run(body.color, id);
     }
-  });
-  orderedList('/themes', 'themes', 'refs', 'theme_id', 'Tema');
-  orderedList('/folders', 'folders', 'files', 'folder_id', 'Pasta');
+  }, 'criou a categoria');
+  orderedList('/themes', 'themes', 'refs', 'theme_id', 'Tema', null, 'criou o tema');
+  orderedList('/folders', 'folders', 'files', 'folder_id', 'Pasta', null, 'criou a pasta');
 
   // ---------- tarefas ----------
 
@@ -700,6 +759,12 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
     ids.forEach((id, pos) => upd.run(categoryId, pos, id));
   }
 
+  const assigneeNames = (taskId) =>
+    q('SELECT u.name FROM task_assignees a JOIN users u ON u.id = a.user_id WHERE a.task_id = ? ORDER BY u.name COLLATE NOCASE')
+      .all(taskId)
+      .map((u) => u.name)
+      .join(', ');
+
   const status = (v) => (STATUSES.includes(v) ? v : bad('Situação inválida.'));
 
   api.post('/tasks', (req, res) => {
@@ -722,6 +787,7 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       );
       if ('assignees' in b) setAssignees(newId, b.assignees);
       placeTask(newId, categoryId, null);
+      log(req, 'criou a tarefa', 'tasks', newId, text(b.title, 'Título', 200, true), assigneeNames(newId));
       return newId;
     });
     res.status(201).json({ id });
@@ -743,6 +809,7 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
         'due_date' in b ? dueDate(b.due_date) : t.due_date,
         id
       );
+      const before = assigneeNames(id);
       if ('assignees' in b) setAssignees(id, b.assignees);
       const categoryId = 'category_id' in b ? intId(b.category_id, 'Categoria') : t.category_id;
       if ('before_id' in b) {
@@ -750,11 +817,27 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       } else if (categoryId !== t.category_id) {
         placeTask(id, categoryId, null);
       }
+      const now = q('SELECT * FROM tasks WHERE id = ?').get(id);
+      if (now.status !== t.status) {
+        if (now.status === 'done') log(req, 'concluiu a tarefa', 'tasks', id, now.title);
+        else if (t.status === 'done') log(req, 'reabriu a tarefa', 'tasks', id, now.title);
+        else log(req, 'mudou a situação da tarefa', 'tasks', id, now.title, STATUS_LABEL[now.status]);
+      }
+      const after = assigneeNames(id);
+      if (after !== before) log(req, 'alterou os responsáveis da tarefa', 'tasks', id, now.title, after || 'Sem responsável');
+      if (now.category_id !== t.category_id) {
+        log(req, 'moveu a tarefa', 'tasks', id, now.title, `Para ${q('SELECT name FROM categories WHERE id = ?').get(now.category_id).name}`);
+      }
+      if (now.title !== t.title || now.description !== t.description || now.due_date !== t.due_date) {
+        log(req, 'editou a tarefa', 'tasks', id, now.title);
+      }
     });
     res.json({ ok: true });
   });
 
   api.delete('/tasks/:id', (req, res) => {
+    const gone = q('SELECT title FROM tasks WHERE id = ?').get(intId(req.params.id));
+    if (gone) log(req, 'excluiu a tarefa', 'tasks', null, gone.title);
     q("DELETE FROM comments WHERE kind = 'task' AND target_id = ?").run(intId(req.params.id));
     q('DELETE FROM tasks WHERE id = ?').run(intId(req.params.id));
     res.json({ ok: true });
@@ -790,6 +873,7 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       req.user.id
     );
     const id = Number(r.lastInsertRowid);
+    log(req, 'adicionou a referência', 'refs', id, text(b.title, 'Título', 200, true));
     await savePreview(id, url);
     res.status(201).json({ id });
   });
@@ -807,6 +891,10 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       'note' in b ? text(b.note, 'Anotação', 5000) : r.note,
       id
     );
+    const now = q('SELECT * FROM refs WHERE id = ?').get(id);
+    if (now.title !== r.title || now.url !== r.url || now.note !== r.note || now.theme_id !== r.theme_id) {
+      log(req, 'editou a referência', 'refs', id, now.title);
+    }
     // Busca a prévia de novo se o link mudou ou se ainda não há nenhuma guardada.
     if (url !== r.url || (url && !r.preview_title && !r.preview_desc && !r.preview_image)) await savePreview(id, url);
     res.json({ ok: true });
@@ -817,6 +905,8 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
   api.delete('/refs/:id', (req, res) => {
     const id = intId(req.params.id);
     const files = q('SELECT filename FROM ref_images WHERE ref_id = ?').all(id);
+    const gone = q('SELECT title FROM refs WHERE id = ?').get(id);
+    if (gone) log(req, 'excluiu a referência', 'refs', null, gone.title);
     q("DELETE FROM comments WHERE kind = 'ref' AND target_id = ?").run(id);
     q('DELETE FROM refs WHERE id = ?').run(id);
     files.forEach((f) => removeFile(f.filename));
@@ -830,7 +920,8 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
     express.raw({ type: () => true, limit: MAX_IMAGE_BYTES }),
     (req, res) => {
       const id = intId(req.params.id);
-      if (!q('SELECT id FROM refs WHERE id = ?').get(id)) throw new HttpError(404, 'Referência não encontrada.');
+      const ref = q('SELECT title FROM refs WHERE id = ?').get(id);
+      if (!ref) throw new HttpError(404, 'Referência não encontrada.');
       const mime = Buffer.isBuffer(req.body) ? imageType(req.body) : null;
       if (!mime) bad('Envie uma imagem JPEG, PNG, WebP ou GIF.');
       if (q('SELECT COUNT(*) AS n FROM ref_images WHERE ref_id = ?').get(id).n >= MAX_IMAGES_PER_REF) {
@@ -845,6 +936,7 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
         req.body.length,
         req.user.id
       );
+      log(req, 'anexou imagens à referência', 'refs', id, ref.title);
       res.status(201).json({ id: Number(r.lastInsertRowid) });
     }
   );
@@ -910,6 +1002,7 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       throw e.status ? e : new HttpError(400, 'O envio foi interrompido. Tente de novo.');
     }
     const r = q('INSERT INTO files (folder_id, name, filename, size, uploaded_by) VALUES (?, ?, ?, ?, ?)').run(folder, name, stored, size, req.user.id);
+    log(req, 'enviou o arquivo', 'files', Number(r.lastInsertRowid), name, `Na pasta ${q('SELECT name FROM folders WHERE id = ?').get(folder).name}`);
     res.status(201).json({ id: Number(r.lastInsertRowid) });
   });
 
@@ -949,8 +1042,9 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
 
   api.delete('/files/:id', (req, res) => {
     const id = intId(req.params.id);
-    const f = q('SELECT filename FROM files WHERE id = ?').get(id);
+    const f = q('SELECT name, filename FROM files WHERE id = ?').get(id);
     if (f) {
+      log(req, 'excluiu o arquivo', 'files', null, f.name);
       q('DELETE FROM files WHERE id = ?').run(id);
       fs.rm(path.join(filesDir, f.filename), { force: true }, () => {});
     }
@@ -1055,6 +1149,8 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       const newId = Number(
         q('INSERT INTO comments (kind, target_id, user_id, body) VALUES (?, ?, ?, ?)').run(b.kind, id, req.user.id, body).lastInsertRowid
       );
+      const title = q(`SELECT title FROM ${TARGETS[b.kind]} WHERE id = ?`).get(id).title;
+      log(req, 'comentou em', TARGETS[b.kind], id, title, body.length > 140 ? `${body.slice(0, 140)}…` : body);
       for (const uid of mentionedUsers(body)) {
         if (uid !== req.user.id) q('INSERT INTO comment_mentions (comment_id, user_id) VALUES (?, ?)').run(newId, uid);
       }
@@ -1116,6 +1212,9 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       hashPassword(password(b.password)),
       b.is_admin ? 1 : 0
     );
+    // Quem chega agora não recebe o histórico inteiro como "não lido".
+    log(req, 'adicionou a pessoa', 'users', Number(r.lastInsertRowid), text(b.name, 'Nome', 80, true));
+    q('UPDATE users SET activity_seen = (SELECT COALESCE(MAX(id), 0) FROM activity) WHERE id = ?').run(Number(r.lastInsertRowid));
     res.status(201).json({ id: Number(r.lastInsertRowid) });
   });
 

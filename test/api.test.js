@@ -18,7 +18,7 @@ let cookieOf;
 
 function client() {
   let cookie = '';
-  return async (method, url, body, headers = { 'X-Requested-With': 'obsoleta' }) => {
+  const call = async (method, url, body, headers = { 'X-Requested-With': 'obsoleta' }) => {
     const res = await fetch(base + url, {
       method,
       headers: { 'Content-Type': 'application/json', cookie, ...headers },
@@ -28,6 +28,8 @@ function client() {
     if (set) cookie = set.split(';')[0];
     return { status: res.status, body: await res.json().catch(() => null) };
   };
+  call.cookie = () => cookie;
+  return call;
 }
 
 async function login() {
@@ -329,4 +331,43 @@ test('arquivos: envio, download seguro, mover, excluir e backup', async () => {
 
   assert.equal((await call('DELETE', `/files/${html}`)).status, 200);
   assert.equal((await call('GET', `/files/${html}`)).status, 404);
+});
+
+test('novidades: registra o que os outros fizeram e marca como visto', async () => {
+  const ana = client();
+  await ana('POST', '/login', { email: 'ana@example.com', password: cookieOf.password });
+  await ana('POST', '/users', { name: 'Dora', email: 'dora@example.com', password: 'senha-da-dora-123' });
+  const dora = client();
+  await dora('POST', '/login', { email: 'dora@example.com', password: 'senha-da-dora-123' });
+  // quem acabou de chegar começa sem pendências
+  assert.equal((await dora('GET', '/state')).body.activity_unread, 0);
+  await ana('POST', '/activity/seen', {});
+
+  const cat = (await dora('POST', '/categories', { name: 'Marketing' })).body.id;
+  const task = (await dora('POST', '/tasks', { category_id: cat, title: 'Criar logo' })).body.id;
+  await dora('PATCH', `/tasks/${task}`, { status: 'done' });
+  await dora('PATCH', `/tasks/${task}`, { before_id: null }); // só reordenar não gera novidade
+  await dora('POST', '/comments', { kind: 'task', id: task, body: 'Ficou pronto' });
+  const th = (await dora('POST', '/themes', { name: 'Marca' })).body.id;
+  const ref = (await dora('POST', '/refs', { theme_id: th, title: 'Paleta' })).body.id;
+  const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(32)]);
+  for (let i = 0; i < 3; i++) {
+    await fetch(`${base}/refs/${ref}/images`, { method: 'POST', headers: { 'X-Requested-With': 'obsoleta', 'Content-Type': 'image/png', cookie: dora.cookie() }, body: png });
+  }
+
+  // a autora não é notificada das próprias ações
+  assert.equal((await dora('GET', '/state')).body.activity_unread, 0);
+  assert.equal((await ana('GET', '/state')).body.activity_unread, 7);
+  const feed = (await ana('GET', '/activity')).body;
+  assert.deepEqual(
+    feed.slice(0, 7).map((a) => a.text),
+    ['anexou imagens à referência', 'adicionou a referência', 'criou o tema', 'comentou em', 'concluiu a tarefa', 'criou a tarefa', 'criou a categoria']
+  );
+  assert.ok(feed.slice(0, 7).every((a) => a.unread));
+  assert.equal(feed[3].detail, 'Ficou pronto');
+  assert.equal(feed[3].target_id, task);
+
+  await ana('POST', '/activity/seen', {});
+  assert.equal((await ana('GET', '/state')).body.activity_unread, 0);
+  assert.ok((await ana('GET', '/activity')).body.every((a) => !a.unread));
 });

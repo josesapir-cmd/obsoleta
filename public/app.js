@@ -782,6 +782,106 @@ function mentionsDialog() {
   dlg.showModal();
 }
 
+// ---------- novidades (sininho) ----------
+
+function openActivityTarget(a) {
+  const go = (v, hash) => {
+    view = v;
+    history.replaceState(null, '', hash);
+    render();
+  };
+  if (a.target_id == null) return toast('Esse item foi excluído.');
+  if (a.kind === 'tasks') {
+    const t = state.tasks.find((x) => x.id === a.target_id);
+    if (!t) return toast('Essa tarefa não existe mais.');
+    go('tasks', '#tarefas');
+    return taskView(t);
+  }
+  if (a.kind === 'refs') {
+    const r = state.refs.find((x) => x.id === a.target_id);
+    if (!r) return toast('Essa referência não existe mais.');
+    go('refs', '#referencias');
+    return refView(r);
+  }
+  if (a.kind === 'files' || a.kind === 'folders') return go('files', '#arquivos');
+  if (a.kind === 'themes') return go('refs', '#referencias');
+  if (a.kind === 'categories') return go('tasks', '#tarefas');
+  if (a.kind === 'users' && me.is_admin) return go('people', '#pessoas');
+}
+
+async function activityDialog() {
+  let items;
+  try {
+    items = await api('GET', '/activity');
+  } catch (e) {
+    return toast(e.message);
+  }
+  const day = (sql) => {
+    const d = new Date(`${sql.replace(' ', 'T')}Z`);
+    const key = d.toDateString();
+    if (key === new Date().toDateString()) return 'Hoje';
+    if (key === new Date(Date.now() - 86400000).toDateString()) return 'Ontem';
+    return d.toLocaleDateString('pt-BR', { day: '2-digit', month: 'long' });
+  };
+  const time = (sql) => new Date(`${sql.replace(' ', 'T')}Z`).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  const rows = [];
+  let lastDay = null;
+  for (const a of items) {
+    const d = day(a.created_at);
+    if (d !== lastDay) rows.push(el('li', { class: 'day' }, d));
+    lastDay = d;
+    const u = userById(a.user_id);
+    rows.push(
+      el(
+        'li',
+        null,
+        el(
+          'button',
+          {
+            class: a.unread ? 'unread' : '',
+            type: 'button',
+            onclick: () => {
+              dlg.close();
+              openActivityTarget(a);
+            },
+          },
+          avatar(a.user_id),
+          el(
+            'span',
+            { class: 'act-text' },
+            el('strong', null, u ? u.name : 'Alguém'),
+            ` ${a.text} `,
+            el('em', null, a.title),
+            a.detail && el('span', { class: 'excerpt' }, a.detail)
+          ),
+          el('span', { class: 'hint' }, time(a.created_at)),
+          a.unread && el('span', { class: 'dot', title: 'Novo' }, el('span', { class: 'sr' }, 'novo'))
+        )
+      )
+    );
+  }
+  const unread = items.filter((a) => a.unread).length;
+  const dlg = el(
+    'dialog',
+    { class: 'modal item' },
+    el(
+      'header',
+      { class: 'item-head' },
+      el('h2', null, 'Novidades'),
+      el('button', { class: 'icon', type: 'button', 'aria-label': 'Fechar', title: 'Fechar', onclick: () => dlg.close() }, '✕')
+    ),
+    el('p', { class: 'hint' }, items.length === 0 ? 'Nada por aqui ainda. O que os outros fizerem no sistema aparece nesta lista.' : unread ? `${unread} desde a sua última visita.` : 'Nada novo desde a sua última visita.'),
+    el('ul', { class: 'activity' }, rows)
+  );
+  dlg.addEventListener('close', () => {
+    dlg.remove();
+    refresh(true);
+  });
+  document.body.append(dlg);
+  dlg.showModal();
+  if (items.length) api('POST', '/activity/seen', { id: items[0].id }).catch(() => {});
+}
+
 // ---------- dados ----------
 
 async function refresh(force = false) {
@@ -1790,6 +1890,18 @@ function render() {
         'button',
         { class: `btn quiet${state.mentions.length ? ' alert' : ''}`, type: 'button', onclick: mentionsDialog },
         state.mentions.length ? `@ ${state.mentions.length} ${state.mentions.length === 1 ? 'menção' : 'menções'}` : '@'
+      ),
+      el(
+        'button',
+        {
+          class: `btn quiet bell${state.activity_unread ? ' has' : ''}`,
+          type: 'button',
+          'aria-label': state.activity_unread ? `Novidades: ${state.activity_unread} não vistas` : 'Novidades',
+          title: 'Novidades',
+          onclick: activityDialog,
+        },
+        '🔔',
+        state.activity_unread > 0 && el('span', { class: 'badge' }, state.activity_unread > 99 ? '99+' : String(state.activity_unread))
       ),
       el('span', { class: 'who' }, me.name),
       el('button', { class: 'btn quiet', type: 'button', onclick: accountDialog }, 'Conta'),
