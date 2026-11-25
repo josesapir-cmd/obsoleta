@@ -13,6 +13,8 @@ let view = location.hash === '#referencias' ? 'refs' : 'tasks';
 const filter = { who: 'all', hideDone: false };
 let dragId = null;
 let focusCat = null;
+const openEmbeds = new Set(); // referências com a publicação do Instagram aberta
+const IMAGE_TYPES = 'image/jpeg,image/png,image/webp,image/gif';
 
 // ---------- utilidades ----------
 
@@ -90,6 +92,8 @@ const fmtDate = (iso) => `${iso.slice(8, 10)}/${iso.slice(5, 7)}${iso.slice(0, 4
 
 function formDialog({ title, fields, submit = 'Salvar', onSubmit, onDelete, deleteLabel = 'Excluir' }) {
   const getters = {};
+  const picked = [];
+  let addFiles = null;
   const err = el('p', { class: 'form-error', role: 'alert' });
 
   const rows = fields.map((f) => {
@@ -121,6 +125,18 @@ function formDialog({ title, fields, submit = 'Salvar', onSubmit, onDelete, dele
         return multi ? on : on[0];
       };
       return el('fieldset', { class: 'field' }, el('legend', null, f.label), el('div', { class: multi ? 'checks' : 'swatches' }, boxes.map((b) => b.node)));
+    } else if (f.type === 'files') {
+      const info = el('p', { class: 'hint' }, f.hint);
+      const show = () => {
+        info.textContent = picked.length ? `${picked.length} imagem(ns) para enviar ao salvar.` : f.hint;
+      };
+      addFiles = (list) => {
+        picked.push(...imagesOnly(list));
+        show();
+      };
+      input = el('input', { id, type: 'file', accept: IMAGE_TYPES, multiple: true, onchange: () => { addFiles(input.files); input.value = ''; } });
+      getters[f.name] = () => picked;
+      return el('div', { class: 'field' }, el('label', { for: id }, f.label), input, info);
     } else if (f.type === 'checkbox') {
       input = el('input', { id, type: 'checkbox', checked: !!f.value });
       getters[f.name] = () => input.checked;
@@ -190,6 +206,103 @@ function formDialog({ title, fields, submit = 'Salvar', onSubmit, onDelete, dele
         el('button', { class: 'btn', type: 'button', onclick: () => dlg.close() }, 'Cancelar'),
         saveBtn
       )
+    )
+  );
+  dlg.addEventListener('close', () => {
+    dlg.remove();
+    refresh(true);
+  });
+  if (addFiles) {
+    dlg.addEventListener('dragover', (e) => hasFiles(e) && e.preventDefault());
+    dlg.addEventListener('drop', (e) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      addFiles(e.dataTransfer.files);
+    });
+  }
+  document.body.append(dlg);
+  dlg.showModal();
+}
+
+// ---------- imagens ----------
+
+const hasFiles = (e) => e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+const imagesOnly = (list) => [...list].filter((f) => IMAGE_TYPES.split(',').includes(f.type));
+
+// Reduz fotos grandes (celular) antes de enviar: no máximo 2000 px no maior lado.
+async function shrink(file) {
+  if (file.type === 'image/gif') return file;
+  try {
+    const bmp = await createImageBitmap(file);
+    const scale = Math.min(1, 2000 / Math.max(bmp.width, bmp.height));
+    if (scale === 1 && file.size < 1.5e6) return file;
+    const c = document.createElement('canvas');
+    c.width = Math.round(bmp.width * scale);
+    c.height = Math.round(bmp.height * scale);
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(0, 0, c.width, c.height);
+    ctx.drawImage(bmp, 0, 0, c.width, c.height);
+    const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.85));
+    return blob || file;
+  } catch {
+    return file;
+  }
+}
+
+async function uploadImages(refId, files) {
+  let n = 0;
+  for (const f of files) {
+    n += 1;
+    toast(`Enviando imagem ${n} de ${files.length}…`);
+    const blob = await shrink(f);
+    const res = await fetch(`/api/refs/${refId}/images`, {
+      method: 'POST',
+      headers: { 'Content-Type': blob.type || 'application/octet-stream', 'X-Requested-With': 'obsoleta' },
+      body: blob,
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || 'Não foi possível enviar a imagem.');
+    }
+  }
+  if (n) toast(n === 1 ? 'Imagem enviada.' : `${n} imagens enviadas.`);
+}
+
+function sendImages(refId, list) {
+  const files = imagesOnly(list);
+  if (!files.length) return toast('Só é possível anexar imagens JPEG, PNG, WebP ou GIF.');
+  return act(() => uploadImages(refId, files));
+}
+
+function lightbox(imageId) {
+  const dlg = el(
+    'dialog',
+    { class: 'modal lightbox' },
+    el('img', { src: `/api/images/${imageId}`, alt: 'Imagem anexada' }),
+    el(
+      'div',
+      { class: 'modal-actions' },
+      el(
+        'button',
+        {
+          class: 'btn danger',
+          type: 'button',
+          onclick: async () => {
+            if (!confirm('Excluir imagem? Não dá para desfazer.')) return;
+            try {
+              await api('DELETE', `/images/${imageId}`);
+            } catch (e) {
+              toast(e.message);
+            }
+            dlg.close();
+          },
+        },
+        'Excluir imagem'
+      ),
+      el('span', { class: 'spacer' }),
+      el('a', { class: 'btn', href: `/api/images/${imageId}`, target: '_blank', rel: 'noopener' }, 'Abrir em nova aba'),
+      el('button', { class: 'btn primary', type: 'button', onclick: () => dlg.close() }, 'Fechar')
     )
   );
   dlg.addEventListener('close', () => {
@@ -437,8 +550,14 @@ function refDialog(ref) {
       { name: 'url', label: 'Link (opcional)', value: ref.url, placeholder: 'https://' },
       { name: 'note', label: 'Anotação', type: 'textarea', value: ref.note },
       { name: 'theme_id', label: 'Tema', type: 'select', numeric: true, value: ref.theme_id, options: state.themes.map((t) => [t.id, t.name]) },
+      { name: 'files', label: 'Anexar imagens', type: 'files', hint: 'Escolha arquivos ou arraste imagens para esta janela.' },
     ],
-    onSubmit: (v) => (ref.id ? api('PATCH', `/refs/${ref.id}`, v) : api('POST', '/refs', v)),
+    onSubmit: async ({ files, ...v }) => {
+      const id = ref.id || (await api('POST', '/refs', v)).id;
+      if (ref.id) await api('PATCH', `/refs/${id}`, v);
+      ref.id = id; // se o envio de imagem falhar, salvar de novo não duplica a referência
+      await uploadImages(id, files.splice(0));
+    },
     onDelete: ref.id ? () => api('DELETE', `/refs/${ref.id}`) : null,
     deleteLabel: 'Excluir referência',
   });
@@ -477,12 +596,84 @@ function host(url) {
   }
 }
 
+// Publicações, reels e vídeos públicos do Instagram têm visualização incorporada própria.
+function instagramEmbed(url) {
+  const m = /^https:\/\/(?:www\.)?instagram\.com\/(?:[\w.]+\/)?(p|reels?|tv)\/([\w-]+)/i.exec(url);
+  if (!m) return null;
+  const kind = m[1].toLowerCase().startsWith('reel') ? 'reel' : m[1].toLowerCase();
+  return `https://www.instagram.com/${kind}/${m[2]}/embed/`;
+}
+
+function linkPreview(r) {
+  const embed = instagramEmbed(r.url);
+  if (embed) {
+    const open = openEmbeds.has(r.id);
+    return el(
+      'div',
+      { class: 'embed' },
+      el(
+        'button',
+        {
+          class: 'btn quiet',
+          type: 'button',
+          'aria-expanded': String(open),
+          onclick: () => {
+            if (open) openEmbeds.delete(r.id);
+            else openEmbeds.add(r.id);
+            render();
+          },
+        },
+        open ? 'Ocultar publicação' : 'Ver publicação do Instagram'
+      ),
+      open && el('iframe', { src: embed, title: `Publicação do Instagram: ${r.title}`, loading: 'lazy', referrerPolicy: 'no-referrer' })
+    );
+  }
+  if (!r.preview_title && !r.preview_desc && !r.preview_image) return null;
+  const img =
+    r.preview_image &&
+    el('img', { src: r.preview_image, alt: '', loading: 'lazy', referrerPolicy: 'no-referrer', onerror: (e) => e.currentTarget.remove() });
+  return el(
+    'a',
+    { class: 'preview', href: r.url, target: '_blank', rel: 'noopener noreferrer' },
+    img,
+    el(
+      'span',
+      { class: 'preview-text' },
+      r.preview_title && r.preview_title !== r.title && el('strong', null, r.preview_title),
+      r.preview_desc && el('span', null, r.preview_desc)
+    )
+  );
+}
+
 function refItem(r) {
   const safe = /^https?:\/\//i.test(r.url);
   const by = userById(r.created_by);
+  const picker = el('input', {
+    type: 'file',
+    accept: IMAGE_TYPES,
+    multiple: true,
+    hidden: true,
+    onchange: () => sendImages(r.id, picker.files),
+  });
   return el(
     'li',
-    { class: 'ref' },
+    {
+      class: 'ref',
+      ondragover: (e) => {
+        if (!hasFiles(e)) return;
+        e.preventDefault();
+        e.currentTarget.classList.add('drop-here');
+      },
+      ondragleave: (e) => {
+        if (!e.currentTarget.contains(e.relatedTarget)) e.currentTarget.classList.remove('drop-here');
+      },
+      ondrop: (e) => {
+        if (!hasFiles(e)) return;
+        e.preventDefault();
+        e.currentTarget.classList.remove('drop-here');
+        sendImages(r.id, e.dataTransfer.files);
+      },
+    },
     el(
       'div',
       { class: 'ref-head' },
@@ -490,7 +681,23 @@ function refItem(r) {
       el('button', { class: 'icon', type: 'button', title: 'Editar referência', 'aria-label': `Editar ${r.title}`, onclick: () => refDialog(r) }, '⋯')
     ),
     r.note && el('p', { class: 'note' }, r.note),
-    el('p', { class: 'hint' }, [safe && host(r.url), by && `por ${by.name}`].filter(Boolean).join(' · '))
+    safe && linkPreview(r),
+    r.images.length > 0 &&
+      el(
+        'div',
+        { class: 'thumbs' },
+        r.images.map((id) =>
+          el('button', { class: 'thumb', type: 'button', 'aria-label': 'Ampliar imagem', onclick: () => lightbox(id) }, el('img', { src: `/api/images/${id}`, alt: '', loading: 'lazy' }))
+        )
+      ),
+    el(
+      'p',
+      { class: 'hint ref-foot' },
+      el('span', null, [safe && host(r.url), by && `por ${by.name}`].filter(Boolean).join(' · ')),
+      el('span', { class: 'spacer' }),
+      picker,
+      el('button', { class: 'btn quiet small', type: 'button', onclick: () => picker.click() }, '+ Imagem')
+    )
   );
 }
 
@@ -689,6 +896,13 @@ function render() {
     if (q) q.focus();
     focusCat = null;
   }
+}
+
+// Soltar um arquivo fora de uma área de destino não deve fazer o navegador abrir o arquivo.
+for (const type of ['dragover', 'drop']) {
+  window.addEventListener(type, (e) => {
+    if (hasFiles(e) && !e.defaultPrevented) e.preventDefault();
+  });
 }
 
 (async function start() {

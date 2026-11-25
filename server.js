@@ -5,10 +5,13 @@ const path = require('node:path');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
+const { fetchPreview } = require('./preview');
 
 const SESSION_DAYS = 30;
 const MIN_PASSWORD = 10;
 const STATUSES = ['todo', 'doing', 'done'];
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_IMAGES_PER_REF = 30;
 const COLORS = ['vinho', 'ambar', 'oliva', 'petroleo', 'azul', 'ameixa', 'grafite'];
 
 class HttpError extends Error {
@@ -92,9 +95,22 @@ function verifyPassword(pw, stored) {
 const DUMMY_HASH = hashPassword(crypto.randomBytes(16).toString('hex'));
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 
+// Tipo decidido pelo conteúdo do arquivo, nunca pelo que o navegador declara.
+function imageType(buf) {
+  if (buf.length < 12) return null;
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+  if (buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+  const head = buf.toString('latin1', 0, 12);
+  if (head.startsWith('GIF87a') || head.startsWith('GIF89a')) return 'image/gif';
+  if (head.startsWith('RIFF') && head.endsWith('WEBP')) return 'image/webp';
+  return null;
+}
+
 // ---------- app ----------
 
-function createApp({ dbPath, production = false, admin } = {}) {
+function createApp({ dbPath, uploadDir, production = false, admin, previewAllowPrivate = false } = {}) {
+  if (!uploadDir) throw new Error('uploadDir é obrigatório.');
+  fs.mkdirSync(uploadDir, { recursive: true });
   const db = new DatabaseSync(dbPath);
   db.exec(`
     PRAGMA journal_mode = WAL;
@@ -150,7 +166,22 @@ function createApp({ dbPath, production = false, admin } = {}) {
       created_by INTEGER REFERENCES users(id),
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+    CREATE TABLE IF NOT EXISTS ref_images (
+      id INTEGER PRIMARY KEY,
+      ref_id INTEGER NOT NULL REFERENCES refs(id) ON DELETE CASCADE,
+      filename TEXT NOT NULL UNIQUE,
+      mime TEXT NOT NULL,
+      size INTEGER NOT NULL,
+      created_by INTEGER REFERENCES users(id),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
+
+  // Migração: colunas da prévia de link, acrescentadas depois da primeira versão.
+  const refCols = db.prepare('PRAGMA table_info(refs)').all().map((c) => c.name);
+  for (const col of ['preview_title', 'preview_desc', 'preview_image', 'preview_site']) {
+    if (!refCols.includes(col)) db.exec(`ALTER TABLE refs ADD COLUMN ${col} TEXT NOT NULL DEFAULT ''`);
+  }
 
   const q = (sql) => db.prepare(sql);
   const tx = (fn) => {
@@ -186,7 +217,7 @@ function createApp({ dbPath, production = false, admin } = {}) {
   app.use((req, res, next) => {
     res.set({
       'Content-Security-Policy':
-        "default-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+        "default-src 'self'; img-src 'self' data: https:; frame-src https://www.instagram.com; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
       'X-Content-Type-Options': 'nosniff',
       'Referrer-Policy': 'no-referrer',
       'X-Robots-Tag': 'noindex, nofollow',
@@ -315,6 +346,11 @@ function createApp({ dbPath, production = false, admin } = {}) {
       if (!assignees.has(r.task_id)) assignees.set(r.task_id, []);
       assignees.get(r.task_id).push(r.user_id);
     }
+    const images = new Map();
+    for (const r of q('SELECT id, ref_id FROM ref_images ORDER BY id').all()) {
+      if (!images.has(r.ref_id)) images.set(r.ref_id, []);
+      images.get(r.ref_id).push(r.id);
+    }
     res.json({
       users: q('SELECT id, name, active FROM users ORDER BY name COLLATE NOCASE').all(),
       categories: q('SELECT id, name, color FROM categories ORDER BY position, id').all(),
@@ -325,7 +361,12 @@ function createApp({ dbPath, production = false, admin } = {}) {
         .all()
         .map((t) => ({ ...t, assignees: assignees.get(t.id) || [] })),
       themes: q('SELECT id, name FROM themes ORDER BY position, id').all(),
-      refs: q('SELECT id, theme_id, title, url, note, created_by FROM refs ORDER BY title COLLATE NOCASE').all(),
+      refs: q(
+        `SELECT id, theme_id, title, url, note, created_by, preview_title, preview_desc, preview_image, preview_site
+         FROM refs ORDER BY title COLLATE NOCASE`
+      )
+        .all()
+        .map((r) => ({ ...r, images: images.get(r.id) || [] })),
     });
   });
 
@@ -475,35 +516,102 @@ function createApp({ dbPath, production = false, admin } = {}) {
     return id;
   };
 
-  api.post('/refs', (req, res) => {
+  async function savePreview(id, url) {
+    const p = url ? await fetchPreview(url, { allowPrivate: previewAllowPrivate }) : null;
+    q('UPDATE refs SET preview_title = ?, preview_desc = ?, preview_image = ?, preview_site = ? WHERE id = ?').run(
+      p ? p.title : '',
+      p ? p.description : '',
+      p ? p.image : '',
+      p ? p.site : '',
+      id
+    );
+  }
+
+  api.post('/refs', async (req, res) => {
     const b = req.body;
+    const url = httpUrl(b.url);
     const r = q('INSERT INTO refs (theme_id, title, url, note, created_by) VALUES (?, ?, ?, ?, ?)').run(
       themeId(b.theme_id),
       text(b.title, 'Título', 200, true),
-      httpUrl(b.url),
+      url,
       text(b.note, 'Anotação', 5000),
       req.user.id
     );
-    res.status(201).json({ id: Number(r.lastInsertRowid) });
+    const id = Number(r.lastInsertRowid);
+    await savePreview(id, url);
+    res.status(201).json({ id });
   });
 
-  api.patch('/refs/:id', (req, res) => {
+  api.patch('/refs/:id', async (req, res) => {
     const id = intId(req.params.id);
     const b = req.body;
     const r = q('SELECT * FROM refs WHERE id = ?').get(id);
     if (!r) throw new HttpError(404, 'Referência não encontrada.');
+    const url = 'url' in b ? httpUrl(b.url) : r.url;
     q('UPDATE refs SET theme_id = ?, title = ?, url = ?, note = ? WHERE id = ?').run(
       'theme_id' in b ? themeId(b.theme_id) : r.theme_id,
       'title' in b ? text(b.title, 'Título', 200, true) : r.title,
-      'url' in b ? httpUrl(b.url) : r.url,
+      url,
       'note' in b ? text(b.note, 'Anotação', 5000) : r.note,
       id
     );
+    // Busca a prévia de novo se o link mudou ou se ainda não há nenhuma guardada.
+    if (url !== r.url || (url && !r.preview_title && !r.preview_desc && !r.preview_image)) await savePreview(id, url);
     res.json({ ok: true });
   });
 
+  const removeFile = (filename) => fs.rm(path.join(uploadDir, filename), { force: true }, () => {});
+
   api.delete('/refs/:id', (req, res) => {
-    q('DELETE FROM refs WHERE id = ?').run(intId(req.params.id));
+    const id = intId(req.params.id);
+    const files = q('SELECT filename FROM ref_images WHERE ref_id = ?').all(id);
+    q('DELETE FROM refs WHERE id = ?').run(id);
+    files.forEach((f) => removeFile(f.filename));
+    res.json({ ok: true });
+  });
+
+  // ---------- imagens das referências ----------
+
+  api.post(
+    '/refs/:id/images',
+    express.raw({ type: () => true, limit: MAX_IMAGE_BYTES }),
+    (req, res) => {
+      const id = intId(req.params.id);
+      if (!q('SELECT id FROM refs WHERE id = ?').get(id)) throw new HttpError(404, 'Referência não encontrada.');
+      const mime = Buffer.isBuffer(req.body) ? imageType(req.body) : null;
+      if (!mime) bad('Envie uma imagem JPEG, PNG, WebP ou GIF.');
+      if (q('SELECT COUNT(*) AS n FROM ref_images WHERE ref_id = ?').get(id).n >= MAX_IMAGES_PER_REF) {
+        bad(`Limite de ${MAX_IMAGES_PER_REF} imagens por referência.`);
+      }
+      const filename = crypto.randomBytes(16).toString('hex');
+      fs.writeFileSync(path.join(uploadDir, filename), req.body, { flag: 'wx' });
+      const r = q('INSERT INTO ref_images (ref_id, filename, mime, size, created_by) VALUES (?, ?, ?, ?, ?)').run(
+        id,
+        filename,
+        mime,
+        req.body.length,
+        req.user.id
+      );
+      res.status(201).json({ id: Number(r.lastInsertRowid) });
+    }
+  );
+
+  api.get('/images/:id', (req, res) => {
+    const img = q('SELECT filename, mime FROM ref_images WHERE id = ?').get(intId(req.params.id));
+    if (!img) throw new HttpError(404, 'Imagem não encontrada.');
+    res.set({ 'Content-Type': img.mime, 'Cache-Control': 'private, max-age=31536000, immutable' });
+    res.sendFile(img.filename, { root: uploadDir, headers: { 'Content-Type': img.mime } }, (err) => {
+      if (err && !res.headersSent) res.status(404).json({ error: 'Imagem não encontrada.' });
+    });
+  });
+
+  api.delete('/images/:id', (req, res) => {
+    const id = intId(req.params.id);
+    const img = q('SELECT filename FROM ref_images WHERE id = ?').get(id);
+    if (img) {
+      q('DELETE FROM ref_images WHERE id = ?').run(id);
+      removeFile(img.filename);
+    }
     res.json({ ok: true });
   });
 
@@ -564,7 +672,9 @@ function createApp({ dbPath, production = false, admin } = {}) {
   app.use((err, req, res, next) => {
     const status = err.status || err.statusCode || 500;
     if (status >= 500) console.error(err);
-    res.status(status).json({ error: status >= 500 ? 'Erro interno.' : err.message });
+    const message =
+      err.type === 'entity.too.large' ? 'Arquivo grande demais (máximo de 10 MB).' : status >= 500 ? 'Erro interno.' : err.message;
+    res.status(status).json({ error: message });
   });
 
   app.locals.db = db;
@@ -578,6 +688,7 @@ if (require.main === module) {
   fs.mkdirSync(dataDir, { recursive: true });
   const app = createApp({
     dbPath: path.join(dataDir, 'obsoleta.db'),
+    uploadDir: path.join(dataDir, 'uploads'),
     production: process.env.NODE_ENV === 'production',
     admin: {
       name: process.env.ADMIN_NAME,

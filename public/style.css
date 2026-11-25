@@ -274,10 +274,46 @@ main.tasks { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .ref { padding: 8px 0; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 3px; }
 .ref-head { display: flex; align-items: flex-start; gap: 8px; }
 .ref-head > :first-child { flex: 1; overflow-wrap: anywhere; padding-top: 4px; }
-.ref a { color: var(--accent); font-weight: 600; text-underline-offset: 2px; }
+.ref-head a { color: var(--accent); font-weight: 600; text-underline-offset: 2px; }
 .note { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; }
 .theme .btn.quiet { align-self: flex-start; padding-left: 0; }
 .empty { padding: 14px 16px 0; }
+
+.ref.drop-here { outline: 2px dashed var(--accent); outline-offset: 4px; border-radius: 4px; }
+.ref-foot { display: flex; align-items: center; gap: 8px; }
+.btn.small { padding: 2px 8px; font-size: 13px; }
+
+.preview {
+  display: flex;
+  gap: 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--card);
+  overflow: hidden;
+  text-decoration: none;
+  color: inherit;
+  font-weight: 400;
+  margin: 4px 0;
+}
+.preview:hover { border-color: var(--muted); }
+.preview img { width: 96px; min-height: 72px; object-fit: cover; flex: none; background: var(--line); }
+.preview-text { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px 8px 0; font-size: 13px; min-width: 0; }
+.preview-text:first-child { padding-left: 10px; }
+.preview-text strong { color: var(--ink); font-weight: 600; }
+.preview-text > * { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; overflow-wrap: anywhere; }
+.preview-text span { color: var(--muted); }
+
+.embed { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.embed .btn { padding-left: 0; }
+.embed iframe { width: 100%; height: 560px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+
+.thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(72px, 1fr)); gap: 6px; margin: 4px 0; }
+.thumb { border: 1px solid var(--line); border-radius: 6px; padding: 0; overflow: hidden; cursor: zoom-in; aspect-ratio: 1; background: var(--line); }
+.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+.lightbox { width: min(900px, calc(100vw - 32px)); }
+.lightbox img { display: block; max-width: 100%; max-height: 72vh; margin: 0 auto 14px; border-radius: 6px; }
+.lightbox a.btn { text-decoration: none; }
 
 /* ---------- pessoas ---------- */
 

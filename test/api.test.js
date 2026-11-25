@@ -2,10 +2,19 @@
 
 const { test, before, after } = require('node:test');
 const assert = require('node:assert/strict');
+const http = require('node:http');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const { createApp } = require('../server');
+const { fetchPreview } = require('../preview');
 
 let server;
 let base;
+let site;
+let siteUrl;
+let uploadDir;
+let cookieOf;
 
 function client() {
   let cookie = '';
@@ -21,9 +30,33 @@ function client() {
   };
 }
 
+async function login() {
+  const res = await fetch(`${base}/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'obsoleta' },
+    body: JSON.stringify({ email: 'ana@example.com', password: cookieOf.password }),
+  });
+  return res.headers.get('set-cookie').split(';')[0];
+}
+
 before(async () => {
+  uploadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'obsoleta-test-'));
+  cookieOf = { password: 'senha-da-ana-123' };
+  site = http.createServer((req, res) => {
+    if (req.url === '/redir') return res.writeHead(302, { Location: '/pagina' }).end();
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(`<html><head><title>Fallback</title>
+      <meta property="og:title" content="Livraria &amp; Caf&#233;">
+      <meta content='Um lugar "bom"' property='og:description'>
+      <meta property="og:image" content="https://cdn.example.com/capa.jpg">
+      <meta property="og:site_name" content="Exemplo"></head></html>`);
+  }).listen(0);
+  await new Promise((r) => site.once('listening', r));
+  siteUrl = `http://127.0.0.1:${site.address().port}`;
   const app = createApp({
     dbPath: ':memory:',
+    uploadDir,
+    previewAllowPrivate: true,
     admin: { name: 'Ana', email: 'ana@example.com', password: 'senha-da-ana-123' },
   });
   server = app.listen(0);
@@ -31,7 +64,11 @@ before(async () => {
   base = `http://127.0.0.1:${server.address().port}/api`;
 });
 
-after(() => server.close());
+after(() => {
+  server.close();
+  site.close();
+  fs.rmSync(uploadDir, { recursive: true, force: true });
+});
 
 test('exige login e o cabeçalho anti-CSRF', async () => {
   const anon = client();
@@ -95,6 +132,53 @@ test('fluxo de tarefas, referências e permissões', async () => {
   assert.equal((await ana('POST', '/me/password', { current: 'errada', next: 'nova-senha-da-ana' })).status, 400);
   assert.equal((await ana('POST', '/me/password', { current: 'senha-da-ana-123', next: 'nova-senha-da-ana' })).status, 200);
   assert.equal((await ana('GET', '/me')).status, 200);
+  cookieOf.password = 'nova-senha-da-ana';
+});
+
+test('prévia de link: lê Open Graph e recusa destinos internos', async () => {
+  const p = await fetchPreview(`${siteUrl}/redir`, { allowPrivate: true });
+  assert.deepEqual(p, { title: 'Livraria & Café', description: 'Um lugar "bom"', image: 'https://cdn.example.com/capa.jpg', site: 'Exemplo' });
+  assert.equal(await fetchPreview(`${siteUrl}/pagina`), null);
+  assert.equal(await fetchPreview('http://localhost/'), null);
+  assert.equal(await fetchPreview('http://[::1]/'), null);
+  assert.equal(await fetchPreview('http://169.254.169.254/latest/meta-data/'), null);
+  assert.equal(await fetchPreview('http://[::ffff:127.0.0.1]/'), null);
+});
+
+test('referência guarda a prévia e aceita imagens', async () => {
+  const cookie = await login();
+  const call = async (method, url, body, type = 'application/json') => {
+    const res = await fetch(base + url, {
+      method,
+      headers: { 'Content-Type': type, 'X-Requested-With': 'obsoleta', cookie },
+      body: type === 'application/json' && body ? JSON.stringify(body) : body,
+    });
+    return res;
+  };
+  const th = (await (await call('POST', '/themes', { name: 'Inspirações' })).json()).id;
+  const ref = (await (await call('POST', '/refs', { theme_id: th, title: 'Vitrine', url: `${siteUrl}/pagina` })).json()).id;
+  let s = await (await call('GET', '/state')).json();
+  assert.equal(s.refs.find((r) => r.id === ref).preview_title, 'Livraria & Café');
+
+  const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(32)]);
+  assert.equal((await call('POST', `/refs/${ref}/images`, '<svg onload=alert(1)>', 'image/svg+xml')).status, 400);
+  assert.equal((await call('POST', `/refs/${ref}/images`, Buffer.alloc(11 * 1024 * 1024), 'image/png')).status, 413);
+  const up = await call('POST', `/refs/${ref}/images`, png, 'image/png');
+  assert.equal(up.status, 201);
+  const imgId = (await up.json()).id;
+  s = await (await call('GET', '/state')).json();
+  assert.deepEqual(s.refs.find((r) => r.id === ref).images, [imgId]);
+
+  const got = await call('GET', `/images/${imgId}`);
+  assert.equal(got.headers.get('content-type'), 'image/png');
+  assert.deepEqual(Buffer.from(await got.arrayBuffer()), png);
+  assert.equal((await fetch(`${base}/images/${imgId}`)).status, 401);
+
+  assert.equal(fs.readdirSync(uploadDir).length, 1);
+  assert.equal((await call('DELETE', `/refs/${ref}`)).status, 200);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(fs.readdirSync(uploadDir).length, 0);
+  assert.equal((await call('GET', `/images/${imgId}`)).status, 404);
 });
 
 test('bloqueia após tentativas repetidas de login', async () => {
