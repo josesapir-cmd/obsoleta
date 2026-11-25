@@ -517,7 +517,8 @@ function mentionSuggest(textarea) {
 function itemDialog({ kind, id, title, details, onEdit, actions }) {
   const list = el('ol', { class: 'thread' });
   let shown = '';
-  const load = async () => {
+  let paletteFor = null; // comentário com a paleta de emojis aberta
+  const load = async (keepScroll = false) => {
     let comments;
     try {
       comments = await api('GET', `/comments?kind=${kind}&id=${id}`);
@@ -558,14 +559,61 @@ function itemDialog({ kind, id, title, details, onEdit, actions }) {
                       'excluir'
                     )
                 ),
-                el('p', { class: 'rich' }, richText(c.body))
+                el('p', { class: 'rich' }, richText(c.body)),
+                commentReactions(c)
               )
             );
           })
         : [el('li', { class: 'hint' }, 'Nenhum comentário ainda.')])
     );
-    list.scrollTop = list.scrollHeight;
+    if (keepScroll !== true) list.scrollTop = list.scrollHeight;
   };
+
+  const react = async (commentId, emoji) => {
+    paletteFor = null;
+    await api('POST', `/comments/${commentId}/reactions`, { emoji }).catch((e) => toast(e.message));
+    shown = '';
+    load(true);
+  };
+  function commentReactions(c) {
+    const chip = (emoji, who) => {
+      const on = who.includes(me.id);
+      return el(
+        'button',
+        {
+          class: `react small${on ? ' on' : ''}`,
+          type: 'button',
+          'aria-pressed': String(on),
+          title: who.map((id) => (userById(id) || {}).name).filter(Boolean).join(', ') || 'Reagir',
+          onclick: () => react(c.id, emoji),
+        },
+        emoji,
+        who.length > 0 && el('span', null, String(who.length))
+      );
+    };
+    const open = paletteFor === c.id;
+    return el(
+      'div',
+      { class: 'c-reactions' },
+      open ? REACTIONS.map((emoji) => chip(emoji, c.reactions[emoji] || [])) : Object.entries(c.reactions).map(([emoji, who]) => chip(emoji, who)),
+      el(
+        'button',
+        {
+          class: 'react small add',
+          type: 'button',
+          'aria-label': open ? 'Fechar emojis' : 'Reagir a este comentário',
+          title: open ? 'Fechar' : 'Reagir',
+          'aria-expanded': String(open),
+          onclick: () => {
+            paletteFor = open ? null : c.id;
+            shown = '';
+            load(true);
+          },
+        },
+        open ? '✕' : '☺+'
+      )
+    );
+  }
 
   const err = el('p', { class: 'form-error', role: 'alert' });
   const input = el('textarea', { rows: 2, placeholder: 'Escreva um comentário. Use @ para marcar alguém.', 'aria-label': 'Novo comentário', maxLength: 5000 });

@@ -229,6 +229,17 @@ test('comentários, menções e permissão de exclusão', async () => {
   await caio('POST', '/comments/seen', { kind: 'task', id: task });
   assert.equal((await caio('GET', '/state')).body.mentions.length, 0);
 
+  // reações em comentários
+  assert.deepEqual((await caio('POST', `/comments/${c1}/reactions`, { emoji: '👍' })).body, { on: true });
+  await ana('POST', `/comments/${c1}/reactions`, { emoji: '👍' });
+  await ana('POST', `/comments/${c1}/reactions`, { emoji: '😂' });
+  assert.deepEqual((await ana('POST', `/comments/${c1}/reactions`, { emoji: '😂' })).body, { on: false });
+  assert.equal((await ana('POST', `/comments/${c1}/reactions`, { emoji: 'x' })).status, 400);
+  assert.equal((await ana('POST', '/comments/99999/reactions', { emoji: '👍' })).status, 404);
+  const listed = (await ana('GET', `/comments?kind=task&id=${task}`)).body;
+  assert.deepEqual(Object.keys(listed[0].reactions), ['👍']);
+  assert.equal(listed[0].reactions['👍'].length, 2);
+
   // só o autor ou admin exclui
   assert.equal((await caio('DELETE', `/comments/${c1}`)).status, 403);
   const c2 = (await caio('POST', '/comments', { kind: 'task', id: task, body: 'Vejo sim' })).body.id;

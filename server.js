@@ -266,6 +266,12 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       last_used_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS comment_reactions (
+      comment_id INTEGER NOT NULL REFERENCES comments(id) ON DELETE CASCADE,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      emoji TEXT NOT NULL,
+      PRIMARY KEY (comment_id, user_id, emoji)
+    );
     CREATE TABLE IF NOT EXISTS image_reactions (
       image_id INTEGER NOT NULL REFERENCES ref_images(id) ON DELETE CASCADE,
       user_id INTEGER NOT NULL REFERENCES users(id),
@@ -1026,8 +1032,18 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
 
   api.get('/comments', (req, res) => {
     const id = target(req.query.kind, req.query.id);
+    const reactions = new Map();
+    for (const r of q(
+      `SELECT r.comment_id, r.emoji, r.user_id FROM comment_reactions r JOIN comments c ON c.id = r.comment_id
+       WHERE c.kind = ? AND c.target_id = ? ORDER BY r.rowid`
+    ).all(req.query.kind, id)) {
+      if (!reactions.has(r.comment_id)) reactions.set(r.comment_id, {});
+      (reactions.get(r.comment_id)[r.emoji] ||= []).push(r.user_id);
+    }
     res.json(
-      q('SELECT id, user_id, body, created_at FROM comments WHERE kind = ? AND target_id = ? ORDER BY id').all(req.query.kind, id)
+      q('SELECT id, user_id, body, created_at FROM comments WHERE kind = ? AND target_id = ? ORDER BY id')
+        .all(req.query.kind, id)
+        .map((c) => ({ ...c, reactions: reactions.get(c.id) || {} }))
     );
   });
 
@@ -1054,6 +1070,17 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
          (SELECT id FROM comments WHERE kind = ? AND target_id = ?)`
     ).run(req.user.id, req.body.kind, id);
     res.json({ ok: true });
+  });
+
+  // Liga ou desliga a reação da própria pessoa a um comentário.
+  api.post('/comments/:id/reactions', (req, res) => {
+    const id = intId(req.params.id);
+    if (!q('SELECT id FROM comments WHERE id = ?').get(id)) throw new HttpError(404, 'Comentário não encontrado.');
+    const emoji = req.body.emoji;
+    if (!REACTIONS.includes(emoji)) bad('Reação inválida.');
+    const removed = q('DELETE FROM comment_reactions WHERE comment_id = ? AND user_id = ? AND emoji = ?').run(id, req.user.id, emoji).changes;
+    if (!removed) q('INSERT INTO comment_reactions (comment_id, user_id, emoji) VALUES (?, ?, ?)').run(id, req.user.id, emoji);
+    res.json({ on: !removed });
   });
 
   api.delete('/comments/:id', (req, res) => {
