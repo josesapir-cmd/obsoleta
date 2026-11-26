@@ -2396,8 +2396,57 @@ function passwordDialog() {
   });
 }
 
+// A tela de entrada mostra só a passkey; e-mail e senha ficam atrás de um link.
+// Navegadores sem passkey vão direto para e-mail e senha.
+let loginWithPassword = false;
+
 function loginView() {
+  const usePassword = loginWithPassword || !passkeysSupported();
   const err = el('p', { class: 'form-error', role: 'alert' });
+  const switchTo = (password) =>
+    el(
+      'button',
+      {
+        class: 'linklike login-switch',
+        type: 'button',
+        onclick: () => {
+          loginWithPassword = password;
+          render();
+          const first = document.getElementById('l-email');
+          if (first) first.focus();
+        },
+      },
+      password ? 'Entrar com e-mail e senha' : 'Entrar com passkey'
+    );
+  const header = [el('h1', { class: 'brand' }, 'Obsoleta'), el('p', { class: 'hint' }, 'Área dos sócios.')];
+
+  if (!usePassword) {
+    const btn = el(
+      'button',
+      {
+        class: 'btn primary',
+        type: 'button',
+        onclick: async () => {
+          err.textContent = '';
+          btn.disabled = true;
+          try {
+            const user = await loginWithPasskey();
+            if (user) {
+              me = user;
+              await refresh(true);
+              return;
+            }
+          } catch (ex) {
+            err.textContent = `${ex.message} Se for o seu primeiro acesso neste aparelho, entre com e-mail e senha.`;
+          }
+          btn.disabled = false;
+        },
+      },
+      'Entrar com passkey'
+    );
+    return el('main', { class: 'login' }, el('form', { onsubmit: (e) => e.preventDefault() }, header, err, btn, switchTo(true)));
+  }
+
   const mail = el('input', { id: 'l-email', type: 'email', required: true, autocomplete: 'username' });
   const pw = el('input', { id: 'l-pw', type: 'password', required: true, autocomplete: 'current-password' });
   const btn = el('button', { class: 'btn primary', type: 'submit' }, 'Entrar');
@@ -2413,6 +2462,7 @@ function loginView() {
           btn.disabled = true;
           try {
             me = await api('POST', '/login', { email: mail.value, password: pw.value });
+            loginWithPassword = false;
             await refresh(true);
             offerPasskey();
           } catch (ex) {
@@ -2421,37 +2471,12 @@ function loginView() {
           }
         },
       },
-      el('h1', { class: 'brand' }, 'Obsoleta'),
-      el('p', { class: 'hint' }, 'Tarefas e referências dos sócios.'),
+      header,
       el('div', { class: 'field' }, el('label', { for: 'l-email' }, 'E-mail'), mail),
       el('div', { class: 'field' }, el('label', { for: 'l-pw' }, 'Senha'), pw),
       err,
       btn,
-      passkeysSupported() &&
-        el(
-          'button',
-          {
-            class: 'btn',
-            type: 'button',
-            onclick: async (e) => {
-              err.textContent = '';
-              e.currentTarget.disabled = true;
-              const button = e.currentTarget;
-              try {
-                const user = await loginWithPasskey();
-                if (user) {
-                  me = user;
-                  await refresh(true);
-                  return;
-                }
-              } catch (ex) {
-                err.textContent = ex.message;
-              }
-              button.disabled = false;
-            },
-          },
-          'Entrar com passkey'
-        )
+      passkeysSupported() && switchTo(false)
     )
   );
 }

@@ -630,6 +630,8 @@ main.people > .hint { padding: 0 16px 24px; }
   padding: 24px;
 }
 .login .brand { font-size: 30px; }
+.login-switch { align-self: center; font-size: 14px; padding: 6px; }
+.login-switch:hover { color: var(--ink); }
 
 #toast {
   position: fixed;
