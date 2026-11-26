@@ -128,6 +128,99 @@ function imageType(buf) {
   return null;
 }
 
+// ---------- pesquisa de mercado: leitura da planilha e itens-âncora ----------
+
+const foldText = (v) => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+
+// CSV separado por ponto e vírgula, com campos entre aspas (o formato pedido à coleta).
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let cur = '';
+  let quoted = false;
+  const src = text.replace(/^\ufeff/, '');
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (quoted) {
+      if (ch === '"') {
+        if (src[i + 1] === '"') {
+          cur += '"';
+          i += 1;
+        } else {
+          quoted = false;
+        }
+      } else {
+        cur += ch;
+      }
+    } else if (ch === '"') {
+      quoted = true;
+    } else if (ch === ';') {
+      row.push(cur);
+      cur = '';
+    } else if (ch === '\n') {
+      row.push(cur);
+      rows.push(row);
+      row = [];
+      cur = '';
+    } else if (ch !== '\r') {
+      cur += ch;
+    }
+  }
+  if (cur || row.length) {
+    row.push(cur);
+    rows.push(row);
+  }
+  return rows.filter((r) => r.some((c) => c.trim()));
+}
+
+// Seções da tela de Cardápio e os itens comparáveis de cada uma.
+const MARKET_SECTIONS = [
+  { title: 'Cafés quentes', items: ['Espresso', 'Espresso duplo', 'Filtrado da casa', 'Filtrado por método ou grão especial', 'Macchiato', 'Cappuccino', 'Latte ou café com leite', 'Flat white', 'Mocha'] },
+  { title: 'Gelados e outras bebidas', items: ['Cold brew', 'Iced latte', 'Espresso tônica', 'Chocolate quente', 'Matcha latte', 'Suco de laranja', 'Água'] },
+  { title: 'Para comer', items: ['Pão de queijo (porção varia)', 'Pão na chapa', 'Croissant simples', 'Misto quente', 'Queijo quente', 'Bolo (fatia)', 'Cookie', 'Brownie'] },
+];
+const MARKET_ANCHORS = MARKET_SECTIONS.flatMap((sec) => sec.items);
+const HOUSE_TYPES = ['cafe', 'padaria', 'brunch', 'livraria'];
+
+// Reconhece, pelo nome escrito no cardápio, os itens que dá para comparar entre casas.
+// Fica de fora o que distorce a comparação: combos, versões com sabor, leite vegetal, adicionais.
+const ML = '( ?\\(?\\d+ ?ml\\)?)?';
+const whole = (pattern, value) => new RegExp(`^(?:${pattern})$`).test(value);
+function anchorOf(item, variation, category) {
+  const it = foldText(item).replace(/\s+/g, ' ');
+  const v = foldText(variation);
+  const cat = foldText(category);
+  if (/combo|combinado/.test(cat) || it.includes('nude') || v.includes('adicional') || v.includes('vegetal')) return '';
+  if (whole(`(cafe )?(espresso|expresso)( simples| curto| classico| padrao)?${ML}`, it) && !cat.includes('gelad') && !/long|duplo|x2/.test(v)) return 'Espresso';
+  if (whole('(espresso|expresso)( simples)? ?/ ?(duplo|carioca)', it)) return /duplo|x2/.test(v) ? 'Espresso duplo' : 'Espresso';
+  if (whole(`(double espresso|(espresso|expresso) duplo)${ML}`, it)) return 'Espresso duplo';
+  if (whole(`(cafe da casa|coado|filtrado da casa( \\(batch brew\\))?|filtrado do dia|cafe coado especial hario system)${ML}`, it)) return 'Filtrado da casa';
+  if (whole(`(filtrado( \\(filter\\)| v60| especial| visitante| microlote)?|v60|coados|cafe na prensa)${ML}`, it) && !cat.includes('gelad') && !v.includes('x2')) {
+    return 'Filtrado por método ou grão especial';
+  }
+  if (whole(`cap+uc+ino( italiano| tradicional)?${ML}`, it) || ((it === 'cappuccino / latte' || it === 'cappuccino / duplo') && v === 'cappuccino')) return 'Cappuccino';
+  if (whole(`(latte|cafe com leite|pingado|latte macchiato)${ML}`, it) || (it === 'cappuccino / latte' && v === 'latte')) return 'Latte ou café com leite';
+  if (whole(`flat white${ML}`, it)) return 'Flat white';
+  if (whole(`macchiat+o${ML}`, it)) return 'Macchiato';
+  if (whole(`(mocha|mocaccino|mochaccino|mocaccino caramelo)${ML}`, it)) return 'Mocha';
+  if (whole(`chocolate quente( cremoso| \\(hot chocolate\\))?${ML}`, it)) return 'Chocolate quente';
+  if (whole(`cold ?brew${ML}`, it)) return 'Cold brew';
+  if (whole('(espresso|expresso) tonica', it)) return 'Espresso tônica';
+  if (whole('(iced latte|latte gelado( \\(iced latte\\))?|iced latte/latte gelado)', it) && !v) return 'Iced latte';
+  if (whole('matcha latte( quente| \\(quente ou gelado\\))?', it) && (v === '' || v === 'quente')) return 'Matcha latte';
+  if (whole('suco de laranja( natural| \\(laranja legal\\))?', it)) return 'Suco de laranja';
+  if (whole('agua( mineral| prata( [sc]/ gas)?| com gas| sem gas| com (ou|e) sem gas| - ?\\d+ml)?( ?-? ?\\d+ ?ml)?', it)) return 'Água';
+  if (it.startsWith('pao de queijo')) return 'Pão de queijo (porção varia)';
+  if (it === 'croissant' || it === 'croissant na chapa') return 'Croissant simples';
+  if (whole('(bolo|bolo do dia|bolos caseiros|bolo \\(cake\\)|bolo da estacao|bolo do dia \\(consultar sabor\\))', it)) return 'Bolo (fatia)';
+  if (it.startsWith('cookie') && !v.includes('2 un')) return 'Cookie';
+  if (whole('brownie( traco| chocolatudo)?', it) && !v.includes('sorvete')) return 'Brownie';
+  if ((it === 'misto quente' || it === 'misto na torrada petropolis') && !v.includes('croissant')) return 'Misto quente';
+  if (it === 'queijo quente' && !v.includes('croissant')) return 'Queijo quente';
+  if (it.startsWith('pao na chapa')) return 'Pão na chapa';
+  return '';
+}
+
 function fileName(v) {
   let s;
   try {
@@ -273,6 +366,41 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       size INTEGER NOT NULL,
       uploaded_by INTEGER REFERENCES users(id),
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS market_houses (
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE,
+      address TEXT NOT NULL DEFAULT '',
+      distance_km REAL,
+      rating REAL,
+      reviews INTEGER,
+      price_range TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT '',
+      maps_url TEXT NOT NULL DEFAULT '',
+      tipo TEXT NOT NULL DEFAULT 'cafe',
+      is_ref INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS market_items (
+      id INTEGER PRIMARY KEY,
+      house_id INTEGER NOT NULL REFERENCES market_houses(id) ON DELETE CASCADE,
+      category TEXT NOT NULL DEFAULT '',
+      item TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      variation TEXT NOT NULL DEFAULT '',
+      price_cents INTEGER,
+      photo_month TEXT NOT NULL DEFAULT '',
+      photo_url TEXT NOT NULL DEFAULT '',
+      reading TEXT NOT NULL DEFAULT '',
+      notes TEXT NOT NULL DEFAULT '',
+      anchor TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS market_items_anchor ON market_items (anchor);
+    CREATE TABLE IF NOT EXISTS menu_draft (
+      anchor TEXT PRIMARY KEY,
+      included INTEGER NOT NULL DEFAULT 0,
+      price_cents INTEGER,
+      updated_by INTEGER REFERENCES users(id),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE TABLE IF NOT EXISTS passkeys (
       id INTEGER PRIMARY KEY,
@@ -1309,6 +1437,169 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       editableExpense(req, f.expense_id);
       q('DELETE FROM expense_files WHERE id = ?').run(id);
       fs.rm(path.join(filesDir, f.filename), { force: true }, () => {});
+    }
+    res.json({ ok: true });
+  });
+
+  // ---------- cardápio: nosso rascunho contra os preços da região ----------
+
+  const cents = (v) => {
+    const m = /^(\d{1,6})(?:[.,](\d{1,2}))?$/.exec(String(v || '').trim().replace(/^R\$\s*/i, ''));
+    return m ? Number(m[1]) * 100 + Number((m[2] || '0').padEnd(2, '0')) : null;
+  };
+  const decimal = (v) => {
+    const n = parseFloat(String(v || '').replace(',', '.'));
+    return Number.isFinite(n) ? n : null;
+  };
+  const cut = (v, max) => String(v || '').trim().slice(0, max);
+  const httpsOrEmpty = (v) => (/^https:\/\//i.test(String(v || '').trim()) ? cut(v, 2000) : '');
+  const TIPO_FROM_SHEET = { 'cafe especial': 'cafe', 'padaria artesanal': 'padaria', 'cafe-restaurante / brunch': 'brunch', 'livraria com cafe': 'livraria' };
+
+  // Recebe a planilha da coleta. Cada casa presente no arquivo tem seus itens substituídos,
+  // então reimportar uma casa (cardápio novo) não duplica nada; as demais ficam como estão.
+  api.post('/market/import', express.text({ type: () => true, limit: '8mb' }), (req, res) => {
+    const rows = parseCsv(typeof req.body === 'string' ? req.body : '');
+    if (rows.length < 2) bad('Planilha vazia ou em formato não reconhecido.');
+    const header = rows[0].map((h) => foldText(h));
+    const col = (name) => header.indexOf(name);
+    for (const required of ['cafe', 'item', 'preco']) {
+      if (col(required) < 0) bad(`A planilha precisa ter a coluna "${required}". Use o arquivo gerado pela coleta, separado por ponto e vírgula.`);
+    }
+    if (rows.length > 20001) bad('Planilha grande demais (máximo de 20.000 linhas).');
+    const get = (row, name) => (col(name) >= 0 ? row[col(name)] || '' : '');
+    const byHouse = new Map();
+    for (const row of rows.slice(1)) {
+      const name = cut(get(row, 'cafe'), 120);
+      if (!name) continue;
+      if (!byHouse.has(name)) byHouse.set(name, []);
+      byHouse.get(name).push(row);
+    }
+    if (!byHouse.size) bad('Nenhuma casa encontrada na planilha.');
+    let items = 0;
+    let anchors = 0;
+    tx(() => {
+      for (const [name, houseRows] of byHouse) {
+        const first = houseRows[0];
+        const tipo = TIPO_FROM_SHEET[foldText(get(first, 'tipo_casa'))];
+        const existing = q('SELECT id FROM market_houses WHERE name = ?').get(name);
+        const id = existing
+          ? existing.id
+          : Number(q('INSERT INTO market_houses (name) VALUES (?)').run(name).lastInsertRowid);
+        q('UPDATE market_houses SET address = ?, distance_km = ?, rating = ?, reviews = ?, price_range = ?, status = ?, maps_url = ? WHERE id = ?').run(
+          cut(get(first, 'endereco'), 300),
+          decimal(get(first, 'distancia_km')),
+          decimal(get(first, 'nota')),
+          /^\d+$/.test(get(first, 'avaliacoes').trim()) ? Number(get(first, 'avaliacoes')) : null,
+          cut(get(first, 'faixa_preco'), 40),
+          cut(get(first, 'situacao'), 40),
+          httpsOrEmpty(get(first, 'url_maps')),
+          id
+        );
+        // Tipo e "referência" só vêm da planilha quando ela traz essas colunas; senão vale o que já foi ajustado na tela.
+        if (tipo) q('UPDATE market_houses SET tipo = ? WHERE id = ?').run(tipo, id);
+        if (col('referencia') >= 0) q('UPDATE market_houses SET is_ref = ? WHERE id = ?').run(foldText(get(first, 'referencia')) === 'sim' ? 1 : 0, id);
+        q('DELETE FROM market_items WHERE house_id = ?').run(id);
+        const insert = q(
+          `INSERT INTO market_items (house_id, category, item, description, variation, price_cents, photo_month, photo_url, reading, notes, anchor)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        );
+        for (const row of houseRows) {
+          const item = cut(get(row, 'item'), 200);
+          if (!item) continue;
+          const price = cents(get(row, 'preco'));
+          const anchor = price ? anchorOf(item, get(row, 'variacao'), get(row, 'categoria')) : '';
+          insert.run(
+            id,
+            cut(get(row, 'categoria'), 120),
+            item,
+            cut(get(row, 'descricao'), 600),
+            cut(get(row, 'variacao'), 120),
+            price,
+            /^\d{4}-\d{2}$/.test(get(row, 'data_foto').trim()) ? get(row, 'data_foto').trim() : '',
+            httpsOrEmpty(get(row, 'url_foto')),
+            cut(foldText(get(row, 'leitura')), 20),
+            cut(get(row, 'observacoes'), 600),
+            anchor
+          );
+          items += 1;
+          if (anchor) anchors += 1;
+        }
+      }
+      log(req, 'importou cardápios da região', 'market', null, `${byHouse.size} casa(s)`, `${items} itens, ${anchors} comparáveis`);
+    });
+    res.json({ houses: byHouse.size, items, anchors });
+  });
+
+  api.get('/market', (req, res) => {
+    // Qualidade do preço: A = leitura clara e foto com até 12 meses; B = foto mais antiga; C = leitura incerta.
+    const limit = new Date();
+    limit.setMonth(limit.getMonth() - 12);
+    const recent = limit.toISOString().slice(0, 7);
+    const quality = (r) => (r.reading !== 'ok' ? 'C' : r.photo_month && r.photo_month >= recent ? 'A' : 'B');
+    const rank = { A: 0, B: 1, C: 2 };
+    // Um preço por casa e item: o de melhor qualidade e, entre esses, o menor (a versão básica).
+    const best = new Map();
+    for (const r of q("SELECT * FROM market_items WHERE anchor <> '' AND price_cents IS NOT NULL ORDER BY id").all()) {
+      const key = `${r.anchor}|${r.house_id}`;
+      const cur = best.get(key);
+      const ql = quality(r);
+      if (!cur || rank[ql] < rank[cur.q] || (ql === cur.q && r.price_cents < cur.cents)) {
+        best.set(key, { anchor: r.anchor, house: r.house_id, cents: r.price_cents, q: ql, label: r.variation ? `${r.item} · ${r.variation}` : r.item, month: r.photo_month, url: r.photo_url });
+      }
+    }
+    const points = {};
+    for (const { anchor, ...point } of best.values()) (points[anchor] ||= []).push(point);
+    for (const list of Object.values(points)) list.sort((a, b) => a.cents - b.cents || a.house - b.house);
+    const draft = {};
+    for (const d of q('SELECT anchor, included, price_cents FROM menu_draft').all()) draft[d.anchor] = { included: !!d.included, price_cents: d.price_cents };
+    res.json({
+      sections: MARKET_SECTIONS,
+      houses: q(
+        `SELECT h.id, h.name, h.distance_km, h.rating, h.reviews, h.price_range, h.maps_url, h.tipo, h.is_ref,
+                (SELECT COUNT(*) FROM market_items i WHERE i.house_id = h.id) AS items
+         FROM market_houses h ORDER BY h.distance_km IS NULL, h.distance_km, h.name`
+      ).all(),
+      points,
+      draft,
+    });
+  });
+
+  api.patch('/market/draft', (req, res) => {
+    const b = req.body;
+    if (!MARKET_ANCHORS.includes(b.anchor)) bad('Item inválido.');
+    const cur = q('SELECT * FROM menu_draft WHERE anchor = ?').get(b.anchor) || { included: 0, price_cents: null };
+    const included = 'included' in b ? (b.included ? 1 : 0) : cur.included;
+    let price = cur.price_cents;
+    if ('price_cents' in b) {
+      if (b.price_cents !== null && (!Number.isSafeInteger(b.price_cents) || b.price_cents <= 0 || b.price_cents > 1e7)) bad('Preço inválido.');
+      price = b.price_cents;
+    }
+    q(
+      `INSERT INTO menu_draft (anchor, included, price_cents, updated_by) VALUES (?, ?, ?, ?)
+       ON CONFLICT(anchor) DO UPDATE SET included = excluded.included, price_cents = excluded.price_cents,
+         updated_by = excluded.updated_by, updated_at = datetime('now')`
+    ).run(b.anchor, included, price, req.user.id);
+    if (included !== cur.included) log(req, included ? 'incluiu no rascunho do cardápio' : 'tirou do rascunho do cardápio', 'market', null, b.anchor);
+    if (price !== cur.price_cents) log(req, 'mudou o preço no rascunho do cardápio', 'market', null, b.anchor, price ? money(price) : 'sem preço');
+    res.json({ ok: true });
+  });
+
+  api.patch('/market/houses/:id', (req, res) => {
+    const id = intId(req.params.id);
+    const h = q('SELECT * FROM market_houses WHERE id = ?').get(id);
+    if (!h) throw new HttpError(404, 'Casa não encontrada.');
+    const tipo = 'tipo' in req.body ? req.body.tipo : h.tipo;
+    if (!HOUSE_TYPES.includes(tipo)) bad('Tipo de casa inválido.');
+    q('UPDATE market_houses SET tipo = ?, is_ref = ? WHERE id = ?').run(tipo, 'is_ref' in req.body ? (req.body.is_ref ? 1 : 0) : h.is_ref, id);
+    res.json({ ok: true });
+  });
+
+  api.delete('/market/houses/:id', (req, res) => {
+    const id = intId(req.params.id);
+    const h = q('SELECT name FROM market_houses WHERE id = ?').get(id);
+    if (h) {
+      q('DELETE FROM market_houses WHERE id = ?').run(id);
+      log(req, 'removeu da pesquisa de cardápios', 'market', null, h.name);
     }
     res.json({ ok: true });
   });

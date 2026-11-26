@@ -511,3 +511,61 @@ test('concluir e desfazer em seguida não deixa rastro nas novidades', async () 
   await ana('PATCH', `/tasks/${task}`, { status: 'done' });
   assert.equal((await dora('GET', '/activity')).body[0].text, 'concluiu a tarefa');
 });
+
+test('cardápio: importa planilha, reconhece itens comparáveis e guarda o rascunho', async () => {
+  const ana = client();
+  await ana('POST', '/login', { email: 'ana@example.com', password: cookieOf.password });
+  const month = new Date().toISOString().slice(0, 7);
+  const line = (...cells) => cells.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(';');
+  const header = line('cafe', 'endereco', 'distancia_km', 'nota', 'avaliacoes', 'faixa_preco', 'situacao', 'url_maps', 'categoria', 'item', 'descricao', 'variacao', 'preco', 'data_foto', 'url_foto', 'leitura', 'observacoes', 'tipo_casa', 'referencia');
+  const row = (cafe, dist, cat, item, variacao, preco, data, leitura, tipo = 'café especial', ref = '') =>
+    line(cafe, 'Rua A, 1', dist, '4,7', '120', 'R$ 20–40', 'aberto', 'https://maps.google.com/?cid=1', cat, item, 'texto; com "aspas"', variacao, preco, data, 'https://lh3.googleusercontent.com/x', leitura, '', tipo, ref);
+  const csv = [
+    header,
+    row('Casa Um', '0,50', 'CAFÉS', 'Espresso (40ml)', '', '9,00', month, 'ok'),
+    row('Casa Um', '0,50', 'CAFÉS', 'Espresso duplo (80ml)', '', '13,00', month, 'ok'),
+    row('Casa Um', '0,50', 'CAFÉS', 'Cappuccino Nude®', '', '18,00', month, 'ok'),
+    row('Casa Um', '0,50', 'COMBOS', 'Croissant e Espresso', '', '34,00', month, 'ok'),
+    row('Casa Um', '0,50', 'DOCES', 'Cookie', '2 UN', '10,00', month, 'ok'),
+    row('Casa Um', '0,50', 'DOCES', 'Cookie', '1 UN', '6,00', month, 'ok'),
+    row('Casa Dois', '1,20', 'cafés', 'expresso simples', '', '8,00', '2024-01', 'ok', 'padaria artesanal', 'sim'),
+    row('Casa Dois', '1,20', 'cafés', 'café com leite', '', '12,00', month, 'incerto', 'padaria artesanal', 'sim'),
+    row('Casa Dois', '1,20', 'cafés', 'cappuccino', '', '', month, 'ilegível', 'padaria artesanal', 'sim'),
+  ].join('\r\n');
+  const send = (body) => fetch(`${base}/market/import`, { method: 'POST', headers: { 'X-Requested-With': 'obsoleta', 'Content-Type': 'text/csv', cookie: ana.cookie() }, body });
+  assert.equal((await send('nada;aqui\n1;2')).status, 400);
+  assert.deepEqual(await (await send(`\ufeff${csv}`)).json(), { houses: 2, items: 9, anchors: 5 });
+
+  let m = (await ana('GET', '/market')).body;
+  assert.deepEqual(m.houses.map((h) => [h.name, h.tipo, h.is_ref, h.distance_km, h.items]), [['Casa Um', 'cafe', 0, 0.5, 6], ['Casa Dois', 'padaria', 1, 1.2, 3]]);
+  const [um, dois] = m.houses.map((h) => h.id);
+  assert.deepEqual(m.points.Espresso.map((p) => [p.house, p.cents, p.q]), [[dois, 800, 'B'], [um, 900, 'A']]);
+  assert.deepEqual(m.points['Espresso duplo'].map((p) => p.cents), [1300]);
+  assert.deepEqual(m.points.Cookie.map((p) => [p.cents, p.label]), [[600, 'Cookie · 1 UN']]);
+  assert.equal(m.points['Latte ou café com leite'][0].q, 'C');
+  assert.equal(m.points.Cappuccino, undefined); // versão com leite vegetal e linha sem preço não contam
+
+  // reimportar a mesma casa substitui os itens em vez de duplicar
+  await send([header, row('Casa Um', '0,50', 'CAFÉS', 'Espresso', '', '10,00', month, 'ok')].join('\n'));
+  m = (await ana('GET', '/market')).body;
+  assert.equal(m.houses.find((h) => h.id === um).items, 1);
+  assert.deepEqual(m.points.Espresso.map((p) => p.cents), [800, 1000]);
+
+  // rascunho
+  assert.equal((await ana('PATCH', '/market/draft', { anchor: 'Inexistente', included: true })).status, 400);
+  assert.equal((await ana('PATCH', '/market/draft', { anchor: 'Espresso', price_cents: -5 })).status, 400);
+  await ana('PATCH', '/market/draft', { anchor: 'Espresso', included: true, price_cents: 950 });
+  await ana('PATCH', '/market/draft', { anchor: 'Espresso', price_cents: null });
+  await ana('PATCH', '/market/draft', { anchor: 'Cookie', included: true });
+  m = (await ana('GET', '/market')).body;
+  assert.deepEqual(m.draft, { Espresso: { included: true, price_cents: null }, Cookie: { included: true, price_cents: null } });
+
+  // ajustar e remover casa
+  assert.equal((await ana('PATCH', `/market/houses/${um}`, { tipo: 'outro' })).status, 400);
+  await ana('PATCH', `/market/houses/${um}`, { tipo: 'brunch', is_ref: true });
+  await ana('DELETE', `/market/houses/${dois}`);
+  m = (await ana('GET', '/market')).body;
+  assert.deepEqual(m.houses.map((h) => [h.name, h.tipo, h.is_ref]), [['Casa Um', 'brunch', 1]]);
+  assert.deepEqual(m.points.Espresso.map((p) => p.cents), [1000]);
+  assert.equal((await fetch(`${base}/market`)).status, 401);
+});

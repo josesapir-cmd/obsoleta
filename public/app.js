@@ -9,7 +9,9 @@ let me = null;
 let state = null;
 let stateJson = '';
 let people = null; // lista completa, só para admin
-let view = { '#referencias': 'refs', '#arquivos': 'files', '#conta': 'ledger' }[location.hash] || 'tasks';
+let view = { '#referencias': 'refs', '#arquivos': 'files', '#conta': 'ledger', '#cardapio': 'market' }[location.hash] || 'tasks';
+let market = null; // dados da aba Cardápio, carregados só quando ela é aberta
+const marketUi = { tipo: 'todas', onlyA: true, selected: null };
 let showSettled = false;
 const filter = { who: 'all', hideDone: false };
 let dragId = null;
@@ -25,6 +27,7 @@ function el(tag, attrs, ...kids) {
     if (v == null || v === false) continue;
     if (k.startsWith('on')) n.addEventListener(k.slice(2), v);
     else if (k === 'class') n.className = v;
+    else if (k === 'style') for (const [prop, value] of Object.entries(v)) n.style.setProperty(prop, value);
     else if (k in n && k !== 'list' && k !== 'form') n[k] = v;
     else n.setAttribute(k, v === true ? '' : v);
   }
@@ -1122,6 +1125,10 @@ function openActivityTarget(a) {
   }
   if (a.kind === 'files' || a.kind === 'folders') return go('files', '#arquivos');
   if (a.kind === 'expenses') return go('ledger', '#conta');
+  if (a.kind === 'market') {
+    go('market', '#cardapio');
+    return refresh(true);
+  }
   if (a.kind === 'themes') return go('refs', '#referencias');
   if (a.kind === 'categories') return go('tasks', '#tarefas');
   if (a.kind === 'users' && me.is_admin) return go('people', '#pessoas');
@@ -1260,12 +1267,13 @@ async function refresh(force = false) {
   connectLive();
   if (!force && busy()) return;
   try {
-    const [s, p] = await Promise.all([api('GET', '/state'), me.is_admin ? api('GET', '/users') : null]);
-    const json = JSON.stringify([s, p]);
+    const [s, p, m] = await Promise.all([api('GET', '/state'), me.is_admin ? api('GET', '/users') : null, view === 'market' ? api('GET', '/market') : null]);
+    const json = JSON.stringify([s, p, m]);
     if (json === stateJson && !force) return;
     stateJson = json;
     state = s;
     people = p;
+    if (m) market = m;
     render();
   } catch (e) {
     if (me) toast(e.message);
@@ -2088,6 +2096,437 @@ function ledgerView() {
   );
 }
 
+// ---------- cardápio: nosso rascunho contra os preços da região ----------
+
+const HOUSE_TYPE = { cafe: 'café especial', padaria: 'padaria artesanal', brunch: 'café-restaurante', livraria: 'livraria com café' };
+const reais = (c) => (c / 100).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const monthLabel = (ym) => (ym ? `${ym.slice(5)}/${ym.slice(0, 4)}` : 'sem data');
+
+function quantile(sorted, q) {
+  const pos = (sorted.length - 1) * q;
+  const lo = Math.floor(pos);
+  const hi = Math.ceil(pos);
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+}
+
+const marketHouse = (id) => market.houses.find((h) => h.id === id);
+const marketVisible = (anchor) =>
+  (market.points[anchor] || []).filter((p) => {
+    const h = marketHouse(p.house);
+    return h && (marketUi.tipo === 'todas' || h.tipo === marketUi.tipo) && (!marketUi.onlyA || p.q === 'A');
+  });
+
+// Eixo de preço de uma seção: cobre todos os preços (e os nossos), com marcas em números redondos.
+function marketAxis(section) {
+  const values = section.items.flatMap((a) => [...(market.points[a] || []).map((p) => p.cents), (market.draft[a] || {}).price_cents].filter(Boolean));
+  if (!values.length) return { min: 0, max: 2000, ticks: [0, 500, 1000, 1500, 2000] };
+  const step = [200, 400, 500, 800, 1000, 2000, 5000].find((st) => (Math.max(...values) - Math.min(...values)) / st <= 7) || 10000;
+  const min = Math.max(0, Math.floor(Math.min(...values) / step) * step - (Math.min(...values) % step === 0 ? step : 0));
+  const max = Math.ceil(Math.max(...values) / step) * step + (Math.max(...values) % step === 0 ? step : 0);
+  const ticks = [];
+  for (let v = min; v <= max; v += step) ticks.push(v);
+  return { min, max, ticks };
+}
+
+function saveDraft(anchor, change) {
+  return act(() => api('PATCH', '/market/draft', { anchor, ...change }));
+}
+
+function houseDialog(h) {
+  formDialog({
+    title: h.name,
+    fields: [
+      { name: 'tipo', label: 'Tipo de casa', type: 'select', value: h.tipo, options: Object.entries(HOUSE_TYPE).map(([v, label]) => [v, label[0].toUpperCase() + label.slice(1)]) },
+      { name: 'is_ref', label: 'É uma referência nossa (aparece em destaque)', type: 'checkbox', value: !!h.is_ref },
+    ],
+    onSubmit: (v) => api('PATCH', `/market/houses/${h.id}`, v),
+    onDelete: () => api('DELETE', `/market/houses/${h.id}`),
+    deleteLabel: 'Remover casa da pesquisa',
+  });
+}
+
+function marketImportButton(primary) {
+  const picker = el('input', {
+    type: 'file',
+    accept: '.csv,text/csv',
+    hidden: true,
+    onchange: async () => {
+      const file = picker.files[0];
+      picker.value = '';
+      if (!file) return;
+      toast('Importando planilha…');
+      try {
+        const res = await fetch('/api/market/import', { method: 'POST', headers: { 'Content-Type': 'text/csv', 'X-Requested-With': 'obsoleta' }, body: await file.text() });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'Não foi possível importar a planilha.');
+        toast(`Importado: ${data.houses} casa(s), ${data.items} itens, ${data.anchors} comparáveis.`);
+      } catch (e) {
+        toast(e.message);
+      }
+      refresh(true);
+    },
+  });
+  return el('span', null, picker, el('button', { class: `btn${primary ? ' primary' : ''}`, type: 'button', onclick: () => picker.click() }, 'Importar planilha'));
+}
+
+function marketRow(anchor, axis, houseCount) {
+  const points = marketVisible(anchor);
+  const prices = points.map((p) => p.cents);
+  const n = prices.length;
+  const median = n ? quantile(prices, 0.5) : null;
+  const draft = market.draft[anchor] || { included: false, price_cents: null };
+  const selected = marketUi.selected === anchor;
+  const pct = (c) => `${Math.max(0, Math.min(100, ((c - axis.min) / (axis.max - axis.min)) * 100))}%`;
+  const select = () => {
+    marketUi.selected = anchor;
+    render();
+  };
+
+  // Pontos de preço igual ou muito próximo são empilhados para nenhum esconder o outro.
+  const near = (axis.max - axis.min) * (12 / 300);
+  const levels = [];
+  const tip = el('div', { class: 'mk-tip', role: 'status', hidden: true });
+  const shows = [];
+  const dots = points.map((p) => {
+    let level = 0;
+    while (levels[level] !== undefined && p.cents - levels[level] < near) level += 1;
+    levels[level] = p.cents;
+    const h = marketHouse(p.house);
+    const show = () => {
+      const left = parseFloat(pct(p.cents));
+      tip.replaceChildren(
+        el('strong', null, `R$ ${reais(p.cents)}`),
+        el('span', null, h.distance_km == null ? h.name : `${h.name} · a ${String(h.distance_km).replace('.', ',')} km`),
+        el('span', { class: 'mk-tip-item' }, `${p.label} · foto de ${monthLabel(p.month)}`)
+      );
+      tip.style.setProperty('left', `${left}%`);
+      tip.style.setProperty('transform', `translateX(${left > 70 ? '-100%' : left < 30 ? '0' : '-50%'})`);
+      tip.hidden = false;
+    };
+    shows.push(show);
+    // O mouse é tratado na faixa inteira (ponto mais próximo); o botão existe para teclado e leitor de tela.
+    return el(
+      'button',
+      {
+        class: `mk-dot${h.is_ref ? ' mk-ref' : ''}${p.q === 'A' ? '' : ' weak'}`,
+        type: 'button',
+        'aria-label': `${h.name}: R$ ${reais(p.cents)}`,
+        style: { left: pct(p.cents), bottom: `${3 + Math.min(level, 5) * 11}px` },
+        onfocus: show,
+        onblur: () => {
+          tip.hidden = true;
+        },
+        onclick: select,
+      },
+      el('span', { 'aria-hidden': 'true' })
+    );
+  });
+  // Pontos vizinhos ficam a poucos pixels: em vez de exigir mira, vale o mais próximo do cursor.
+  let hot = -1;
+  const track = (e) => {
+    let best = -1;
+    let bestDist = 28 * 28;
+    dots.forEach((d, i) => {
+      const r = d.getBoundingClientRect();
+      const dx = e.clientX - (r.left + r.width / 2);
+      const dy = e.clientY - (r.top + r.height / 2);
+      if (dx * dx + dy * dy < bestDist) {
+        bestDist = dx * dx + dy * dy;
+        best = i;
+      }
+    });
+    if (best === hot) return;
+    if (hot >= 0) dots[hot].classList.remove('hot');
+    hot = best;
+    if (hot < 0) {
+      tip.hidden = true;
+      return;
+    }
+    dots[hot].classList.add('hot');
+    shows[hot]();
+  };
+  const untrack = () => {
+    if (hot >= 0) dots[hot].classList.remove('hot');
+    hot = -1;
+    tip.hidden = true;
+  };
+
+  const ours = el('span', { class: 'mk-ours', 'aria-hidden': 'true', hidden: !(draft.included && draft.price_cents), style: { left: pct(draft.price_cents || 0) } });
+  const parse = (text) => {
+    if (!text.trim()) return null;
+    try {
+      return parseMoney(text);
+    } catch {
+      return undefined;
+    }
+  };
+  const input = el('input', {
+    type: 'text',
+    inputMode: 'decimal',
+    value: draft.price_cents ? reais(draft.price_cents) : '',
+    placeholder: '—',
+    'aria-label': `Nosso preço para ${anchor}, em reais`,
+    // A marca na faixa acompanha a digitação; o valor só é gravado ao sair do campo ou com Enter.
+    oninput: () => {
+      const c = parse(input.value);
+      ours.hidden = !c;
+      if (c) ours.style.setProperty('left', pct(c));
+    },
+    onkeydown: (e) => e.key === 'Enter' && input.blur(),
+    onchange: () => {
+      const c = parse(input.value);
+      if (c === undefined) return toast('Valor inválido. Use o formato 12,50.');
+      if (c === draft.price_cents) return;
+      // Dar preço a um item fora do rascunho também o inclui.
+      saveDraft(anchor, c && !draft.included ? { price_cents: c, included: true } : { price_cents: c });
+    },
+  });
+
+  let pos1 = draft.included ? 'Sem preço definido' : 'Fora do rascunho';
+  let pos2 = draft.included ? 'digite um valor para comparar' : 'marque para incluir';
+  if (draft.included && draft.price_cents && !n) {
+    pos1 = 'Sem comparação';
+    pos2 = 'nenhuma casa neste filtro';
+  } else if (draft.included && draft.price_cents) {
+    const diff = draft.price_cents - median;
+    const below = prices.filter((c) => c < draft.price_cents).length;
+    const above = prices.filter((c) => c > draft.price_cents).length;
+    pos1 = Math.abs(diff) < 1 ? 'Na mediana' : `R$ ${reais(Math.abs(diff))} ${diff > 0 ? 'acima' : 'abaixo'} da mediana`;
+    pos2 = !above && below ? `o mais caro entre ${n} casas` : !below && above ? `o mais barato entre ${n} casas` : `mais caro que ${below} de ${n} casas`;
+  }
+  const check = el('input', {
+    type: 'checkbox',
+    checked: draft.included,
+    'aria-label': `Incluir ${anchor} no nosso cardápio`,
+    onchange: () => saveDraft(anchor, { included: check.checked }),
+  });
+
+  return el(
+    'div',
+    { class: `mk-row${selected ? ' on' : ''}${draft.included ? '' : ' out'}` },
+    el(
+      'div',
+      { class: 'mk-name' },
+      check,
+      el(
+        'div',
+        null,
+        el('button', { class: 'mk-item', type: 'button', 'aria-pressed': String(selected), onclick: select }, anchor),
+        el(
+          'div',
+          { class: 'mk-presence' },
+          el('span', { class: 'mk-bar', 'aria-hidden': 'true' }, el('span', { style: { width: `${houseCount ? Math.round((n / houseCount) * 100) : 0}%` } })),
+          el('span', { class: 'hint' }, `${n} de ${houseCount} casas${n > 0 && n < 5 ? ' · amostra pequena' : ''}`)
+        )
+      )
+    ),
+    el(
+      'div',
+      {
+        class: 'mk-strip',
+        role: 'img',
+        onmousemove: track,
+        onmouseleave: untrack,
+        onclick: select,
+        'aria-label': n ? `${anchor}: ${n} casas, de R$ ${reais(prices[0])} a R$ ${reais(prices[n - 1])}, mediana R$ ${reais(median)}` : `${anchor}: nenhuma casa neste filtro`,
+      },
+      axis.ticks.map((t) => el('span', { class: 'mk-grid', 'aria-hidden': 'true', style: { left: pct(t) } })),
+      el('span', { class: 'mk-base', 'aria-hidden': 'true' }),
+      n >= 4 && el('span', { class: 'mk-band', 'aria-hidden': 'true', style: { left: pct(quantile(prices, 0.25)), width: `${parseFloat(pct(quantile(prices, 0.75))) - parseFloat(pct(quantile(prices, 0.25)))}%` } }),
+      n >= 1 && el('span', { class: 'mk-median', 'aria-hidden': 'true', style: { left: pct(median) } }),
+      dots,
+      ours,
+      tip
+    ),
+    el('span', { class: 'mk-num' }, n ? reais(median) : '—'),
+    el('label', { class: 'mk-price' }, el('span', { 'aria-hidden': 'true' }, 'R$'), input),
+    el('div', { class: 'mk-pos' }, el('strong', null, pos1), el('span', { class: 'hint' }, pos2))
+  );
+}
+
+function marketDetail() {
+  const anchor = marketUi.selected;
+  const points = marketVisible(anchor);
+  const prices = points.map((p) => p.cents);
+  const draft = market.draft[anchor] || {};
+  const rows = points.map((p) => {
+    const h = marketHouse(p.house);
+    return {
+      sort: p.cents,
+      node: el(
+        'li',
+        null,
+        el('span', { class: `mk-mark${h.is_ref ? ' mk-ref' : ''}${p.q === 'A' ? '' : ' weak'}`, 'aria-hidden': 'true' }),
+        el(
+          'div',
+          null,
+          el('button', { class: `mk-house${h.is_ref ? ' mk-ref' : ''}`, type: 'button', title: 'Ajustar tipo e referência', onclick: () => houseDialog(h) }, h.name),
+          el('span', { class: 'hint' }, p.label),
+          el(
+            'span',
+            { class: 'hint' },
+            [HOUSE_TYPE[h.tipo], h.distance_km != null && `a ${String(h.distance_km).replace('.', ',')} km`, `foto de ${monthLabel(p.month)}`, p.q === 'B' && 'foto antiga', p.q === 'C' && 'leitura incerta'].filter(Boolean).join(' · '),
+            p.url && ' · ',
+            p.url && el('a', { href: p.url, target: '_blank', rel: 'noopener noreferrer' }, 'ver foto')
+          )
+        ),
+        el('span', { class: 'mk-num' }, `R$ ${reais(p.cents)}`)
+      ),
+    };
+  });
+  if (draft.included && draft.price_cents) {
+    rows.push({
+      sort: draft.price_cents - 0.5,
+      node: el('li', { class: 'ours' }, el('span', { class: 'mk-mark ours', 'aria-hidden': 'true' }), el('div', null, el('strong', null, 'Nosso preço'), el('span', { class: 'hint' }, 'rascunho')), el('strong', { class: 'mk-num' }, `R$ ${reais(draft.price_cents)}`)),
+    });
+  }
+  rows.sort((a, b) => a.sort - b.sort);
+  return el(
+    'aside',
+    { class: 'mk-detail', 'aria-label': 'Detalhe do item' },
+    el('span', { class: 'mk-eyebrow' }, 'Casa por casa'),
+    el('h2', null, anchor),
+    el('p', { class: 'hint' }, prices.length ? `${prices.length} casas · de R$ ${reais(prices[0])} a R$ ${reais(prices[prices.length - 1])} · mediana R$ ${reais(quantile(prices, 0.5))}` : 'Nenhuma casa neste filtro.'),
+    el('ul', null, rows.map((r) => r.node)),
+    el('p', { class: 'hint' }, 'Preço lido de foto de cardápio, não confirmado no local. Volumes e porções variam: o texto abaixo do nome é o item como está escrito no cardápio. Clique no nome da casa para ajustar o tipo ou marcá-la como referência.')
+  );
+}
+
+function marketView() {
+  if (!market) return el('main', { class: 'market' }, el('p', { class: 'hint empty' }, 'Carregando…'));
+  if (!market.houses.length) {
+    return el(
+      'main',
+      { class: 'market' },
+      el('div', { class: 'mk-head' }, el('div', null, el('h1', null, 'Cardápio'), el('p', { class: 'hint' }, 'Compare o nosso cardápio com os preços das casas da região.'))),
+      el(
+        'div',
+        { class: 'backup' },
+        el('h2', null, 'Ainda não há pesquisa importada'),
+        el('p', { class: 'hint' }, 'Importe a planilha da coleta de cardápios (arquivo .csv separado por ponto e vírgula, com as colunas cafe, item, preco, categoria, variacao, data_foto e leitura). O sistema reconhece sozinho os itens comparáveis, como espresso, cappuccino e croissant.'),
+        marketImportButton(true)
+      )
+    );
+  }
+  const anchors = market.sections.flatMap((sec) => sec.items);
+  if (!anchors.includes(marketUi.selected)) marketUi.selected = anchors.find((a) => (market.points[a] || []).length) || anchors[0];
+  const houseCount = market.houses.filter((h) => marketUi.tipo === 'todas' || h.tipo === marketUi.tipo).length;
+
+  // Resumo do rascunho: quantos itens, e em média quanto acima ou abaixo da mediana de cada um.
+  let included = 0;
+  let priced = 0;
+  let diffSum = 0;
+  let diffCount = 0;
+  for (const a of anchors) {
+    const d = market.draft[a];
+    if (!d || !d.included) continue;
+    included += 1;
+    if (!d.price_cents) continue;
+    priced += 1;
+    const prices = marketVisible(a).map((p) => p.cents);
+    if (!prices.length) continue;
+    const median = quantile(prices, 0.5);
+    diffSum += (d.price_cents - median) / median;
+    diffCount += 1;
+  }
+  const avg = diffCount ? diffSum / diffCount : null;
+  const tile = (label, value, note) => el('div', { class: 'balance' }, el('span', { class: 'hint' }, label), el('strong', null, value), el('span', { class: 'hint' }, note));
+  const onlyA = el('input', {
+    type: 'checkbox',
+    checked: marketUi.onlyA,
+    onchange: () => {
+      marketUi.onlyA = onlyA.checked;
+      render();
+    },
+  });
+  const usedTypes = ['todas', ...Object.keys(HOUSE_TYPE).filter((t) => market.houses.some((h) => h.tipo === t))];
+  const legend = (cls, label) => el('span', null, el('span', { class: cls, 'aria-hidden': 'true' }), label);
+
+  return el(
+    'main',
+    { class: 'market' },
+    el(
+      'div',
+      { class: 'mk-head' },
+      el('div', null, el('h1', null, 'Cardápio'), el('p', { class: 'hint' }, 'Marque o que entra no nosso cardápio e teste um preço. Cada ponto é o preço de uma casa da região para o mesmo item.')),
+      el(
+        'div',
+        { class: 'mk-tiles' },
+        tile('No nosso rascunho', `${included} ${included === 1 ? 'item' : 'itens'}`, `${priced} com preço definido`),
+        tile('Nosso nível de preço', avg === null ? '—' : Math.abs(avg) < 0.005 ? 'Na mediana' : `${Math.round(Math.abs(avg) * 100)}% ${avg > 0 ? 'acima' : 'abaixo'}`, avg === null ? 'defina preços para calcular' : 'média dos itens, contra a mediana de cada um'),
+        tile('Base de comparação', `${houseCount} ${houseCount === 1 ? 'casa' : 'casas'}`, `${market.houses.reduce((n, h) => n + h.items, 0)} itens de cardápio importados`)
+      )
+    ),
+    el(
+      'div',
+      { class: 'toolbar mk-filters' },
+      el(
+        'div',
+        { class: 'mk-chips', role: 'group', 'aria-label': 'Tipo de casa' },
+        usedTypes.map((t) =>
+          el(
+            'button',
+            {
+              class: `mk-chip${marketUi.tipo === t ? ' on' : ''}`,
+              type: 'button',
+              'aria-pressed': String(marketUi.tipo === t),
+              onclick: () => {
+                marketUi.tipo = t;
+                render();
+              },
+            },
+            t === 'todas' ? 'Todas as casas' : HOUSE_TYPE[t][0].toUpperCase() + HOUSE_TYPE[t].slice(1)
+          )
+        )
+      ),
+      el('label', { class: 'check', title: 'Esconde preços de fotos com mais de 12 meses e de leitura incerta' }, onlyA, 'Só preços confiáveis'),
+      el('span', { class: 'spacer' }),
+      marketImportButton(false)
+    ),
+    el(
+      'div',
+      { class: 'mk-legend', 'aria-label': 'Legenda' },
+      legend('mk-mark', 'casa'),
+      legend('mk-mark mk-ref', 'referência nossa'),
+      legend('mk-mark weak', 'foto antiga ou leitura incerta'),
+      legend('mk-key-band', 'metade central'),
+      legend('mk-key-median', 'mediana'),
+      legend('mk-key-ours', 'nosso preço')
+    ),
+    el(
+      'div',
+      { class: 'mk-body' },
+      el(
+        'div',
+        { class: 'mk-table' },
+        el(
+          'div',
+          { class: 'mk-inner' },
+          market.sections.map((sec) => {
+            const axis = marketAxis(sec);
+            const pct = (c) => `${((c - axis.min) / (axis.max - axis.min)) * 100}%`;
+            return el(
+              'section',
+              { 'aria-label': sec.title },
+              el(
+                'div',
+                { class: 'mk-row mk-sec' },
+                el('h2', null, sec.title),
+                el('div', { class: 'mk-ticks', 'aria-hidden': 'true' }, axis.ticks.map((t) => el('span', { style: { left: pct(t) } }, `R$ ${t / 100}`))),
+                el('span', { class: 'hint mk-num' }, 'Mediana'),
+                el('span', { class: 'hint' }, 'Nosso preço'),
+                el('span', { class: 'hint' }, 'Onde ficamos')
+              ),
+              sec.items.map((a) => marketRow(a, axis, houseCount))
+            );
+          })
+        )
+      ),
+      marketDetail()
+    )
+  );
+}
+
 // ---------- pessoas ----------
 
 function personDialog(u) {
@@ -2510,6 +2949,7 @@ function render() {
           view = id;
           history.replaceState(null, '', hash);
           render();
+          if (id === 'market') refresh(true); // esta aba tem dados próprios, buscados ao abrir
         },
       },
       label
@@ -2520,7 +2960,7 @@ function render() {
       'header',
       { class: 'top' },
       el('span', { class: 'brand' }, 'Obsoleta'),
-      el('nav', null, tab('tasks', 'Tarefas', '#tarefas'), tab('refs', 'Referências', '#referencias'), tab('files', 'Arquivos', '#arquivos'), tab('ledger', 'Conta corrente', '#conta'), me.is_admin && tab('people', 'Pessoas', '#pessoas')),
+      el('nav', null, tab('tasks', 'Tarefas', '#tarefas'), tab('refs', 'Referências', '#referencias'), tab('files', 'Arquivos', '#arquivos'), tab('ledger', 'Conta corrente', '#conta'), tab('market', 'Cardápio', '#cardapio'), me.is_admin && tab('people', 'Pessoas', '#pessoas')),
       el('span', { class: 'spacer' }),
       el(
         'button',
@@ -2562,11 +3002,14 @@ function render() {
         'Sair'
       )
     ),
-    view === 'refs' ? refsView() : view === 'files' ? filesView() : view === 'ledger' ? ledgerView() : view === 'people' ? peopleView() : tasksView()
+    view === 'refs' ? refsView() : view === 'files' ? filesView() : view === 'ledger' ? ledgerView() : view === 'market' ? marketView() : view === 'people' ? peopleView() : tasksView()
   );
 
   const board = root.querySelector('.board');
   if (board) board.scrollLeft = scrollLeft;
+  // No celular as abas rolam para o lado: garante que a aba atual esteja à vista.
+  const current = root.querySelector('.tab.on');
+  if (current && current.scrollIntoView) current.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   if (focusCat != null) {
     const q = root.querySelector(`.column[data-cat="${focusCat}"] .quick`);
     if (q) q.focus();
