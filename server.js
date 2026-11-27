@@ -450,6 +450,11 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
     );
   `);
 
+  // Migração: Instagram das casas da pesquisa de cardápios.
+  if (!db.prepare('PRAGMA table_info(market_houses)').all().some((c) => c.name === 'instagram')) {
+    db.exec("ALTER TABLE market_houses ADD COLUMN instagram TEXT NOT NULL DEFAULT ''");
+  }
+
   // Migração: até qual novidade cada pessoa já viu.
   if (!db.prepare('PRAGMA table_info(users)').all().some((c) => c.name === 'activity_seen')) {
     db.exec('ALTER TABLE users ADD COLUMN activity_seen INTEGER NOT NULL DEFAULT 0');
@@ -1453,6 +1458,14 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
   };
   const cut = (v, max) => String(v || '').trim().slice(0, max);
   const httpsOrEmpty = (v) => (/^https:\/\//i.test(String(v || '').trim()) ? cut(v, 2000) : '');
+  // Aceita "@casa", "casa" ou o endereço completo; guarda sempre o endereço do perfil.
+  const instagramUrl = (v) => {
+    const raw = String(v || '').trim();
+    if (!raw) return '';
+    const m = /^(?:https?:\/\/(?:www\.)?instagram\.com\/)?@?([A-Za-z0-9._]{1,30})\/?(?:\?.*)?$/.exec(raw);
+    if (!m) bad('Instagram inválido. Use o @ do perfil ou o endereço instagram.com/perfil.');
+    return `https://www.instagram.com/${m[1]}/`;
+  };
   const TIPO_FROM_SHEET = { 'cafe especial': 'cafe', 'padaria artesanal': 'padaria', 'cafe-restaurante / brunch': 'brunch', 'livraria com cafe': 'livraria' };
 
   // Recebe a planilha da coleta. Cada casa presente no arquivo tem seus itens substituídos,
@@ -1498,6 +1511,7 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
         // Tipo e "referência" só vêm da planilha quando ela traz essas colunas; senão vale o que já foi ajustado na tela.
         if (tipo) q('UPDATE market_houses SET tipo = ? WHERE id = ?').run(tipo, id);
         if (col('referencia') >= 0) q('UPDATE market_houses SET is_ref = ? WHERE id = ?').run(foldText(get(first, 'referencia')) === 'sim' ? 1 : 0, id);
+        if (get(first, 'instagram').trim()) q('UPDATE market_houses SET instagram = ? WHERE id = ?').run(instagramUrl(get(first, 'instagram')), id);
         q('DELETE FROM market_items WHERE house_id = ?').run(id);
         const insert = q(
           `INSERT INTO market_items (house_id, category, item, description, variation, price_cents, photo_month, photo_url, reading, notes, anchor)
@@ -1555,7 +1569,7 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
     res.json({
       sections: MARKET_SECTIONS,
       houses: q(
-        `SELECT h.id, h.name, h.distance_km, h.rating, h.reviews, h.price_range, h.maps_url, h.tipo, h.is_ref,
+        `SELECT h.id, h.name, h.address, h.distance_km, h.rating, h.reviews, h.price_range, h.status, h.maps_url, h.instagram, h.tipo, h.is_ref,
                 (SELECT COUNT(*) FROM market_items i WHERE i.house_id = h.id) AS items
          FROM market_houses h ORDER BY h.distance_km IS NULL, h.distance_km, h.name`
       ).all(),
@@ -1590,7 +1604,12 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
     if (!h) throw new HttpError(404, 'Casa não encontrada.');
     const tipo = 'tipo' in req.body ? req.body.tipo : h.tipo;
     if (!HOUSE_TYPES.includes(tipo)) bad('Tipo de casa inválido.');
-    q('UPDATE market_houses SET tipo = ?, is_ref = ? WHERE id = ?').run(tipo, 'is_ref' in req.body ? (req.body.is_ref ? 1 : 0) : h.is_ref, id);
+    q('UPDATE market_houses SET tipo = ?, is_ref = ?, instagram = ? WHERE id = ?').run(
+      tipo,
+      'is_ref' in req.body ? (req.body.is_ref ? 1 : 0) : h.is_ref,
+      'instagram' in req.body ? instagramUrl(req.body.instagram) : h.instagram,
+      id
+    );
     res.json({ ok: true });
   });
 

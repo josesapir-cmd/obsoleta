@@ -610,6 +610,16 @@ main.market { --mk-dot: #8a8277; --mk-ref: #257de0; --mk-soft: #e6dece; --mk-gri
 .mk-key-median { width: 2px; height: 14px; background: var(--muted); }
 .mk-key-ours { width: 3px; height: 16px; border-radius: 2px; background: var(--accent); }
 
+.mk-houses { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 16px 0; }
+.mk-badge { display: inline-flex; align-items: center; gap: 6px; min-height: 30px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); font-size: 13px; cursor: pointer; }
+.mk-badge:hover { border-color: var(--muted); }
+.mk-badge-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--mk-dot); flex: none; }
+.mk-badge.on { border-color: var(--mk-ref); background: color-mix(in srgb, var(--mk-ref) 12%, var(--card)); font-weight: 600; }
+.mk-badge.on .mk-badge-dot { background: var(--mk-ref); }
+.mk-badge.focus { box-shadow: 0 0 0 2px var(--mk-ref); }
+.mk-card { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin: 10px 16px 0; padding: 12px 14px; background: var(--surface); border: 1px solid var(--mk-ref); border-radius: 8px; }
+.mk-card > div:first-child { flex: 999 1 320px; min-width: 0; }
+.mk-card-links { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .mk-body { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 16px; padding: 12px 16px 32px; }
 .mk-table { flex: 999 1 720px; min-width: 0; overflow-x: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
 .mk-inner { min-width: 880px; }

@@ -11,7 +11,7 @@ let stateJson = '';
 let people = null; // lista completa, só para admin
 let view = { '#referencias': 'refs', '#arquivos': 'files', '#conta': 'ledger', '#cardapio': 'market' }[location.hash] || 'tasks';
 let market = null; // dados da aba Cardápio, carregados só quando ela é aberta
-const marketUi = { tipo: 'todas', onlyA: true, selected: null };
+const marketUi = { tipo: 'todas', onlyA: true, selected: null, highlight: null, focus: null };
 let showSettled = false;
 const filter = { who: 'all', hideDone: false };
 let dragId = null;
@@ -2137,12 +2137,42 @@ function houseDialog(h) {
     title: h.name,
     fields: [
       { name: 'tipo', label: 'Tipo de casa', type: 'select', value: h.tipo, options: Object.entries(HOUSE_TYPE).map(([v, label]) => [v, label[0].toUpperCase() + label.slice(1)]) },
-      { name: 'is_ref', label: 'É uma referência nossa (aparece em destaque)', type: 'checkbox', value: !!h.is_ref },
+      { name: 'instagram', label: 'Instagram', value: h.instagram ? h.instagram.replace(/^https:\/\/www\.instagram\.com\//, '@').replace(/\/$/, '') : '', placeholder: '@perfil' },
+      { name: 'is_ref', label: 'É uma referência nossa (já abre em destaque)', type: 'checkbox', value: !!h.is_ref },
     ],
-    onSubmit: (v) => api('PATCH', `/market/houses/${h.id}`, v),
+    onSubmit: async (v) => {
+      await api('PATCH', `/market/houses/${h.id}`, v);
+      if (v.is_ref) marketUi.highlight.add(h.id);
+      else if (h.is_ref) marketUi.highlight.delete(h.id);
+    },
     onDelete: () => api('DELETE', `/market/houses/${h.id}`),
     deleteLabel: 'Remover casa da pesquisa',
   });
+}
+
+// Ficha da casa clicada: dados do Google e os links para ver avaliações, fotos e o Instagram.
+function marketHouseCard(h) {
+  const facts = [
+    HOUSE_TYPE[h.tipo],
+    h.distance_km != null && `a ${String(h.distance_km).replace('.', ',')} km`,
+    h.rating != null && `nota ${String(h.rating).replace('.', ',')}${h.reviews ? ` em ${h.reviews.toLocaleString('pt-BR')} avaliações` : ''}`,
+    h.price_range && `faixa ${h.price_range}`,
+    `${h.items} itens de cardápio`,
+  ].filter(Boolean);
+  return el(
+    'div',
+    { class: 'mk-card' },
+    el('div', null, el('strong', null, h.name), el('p', { class: 'hint' }, facts.join(' · ')), h.address && el('p', { class: 'hint' }, h.address)),
+    el(
+      'div',
+      { class: 'mk-card-links' },
+      h.maps_url && el('a', { class: 'btn', href: h.maps_url, target: '_blank', rel: 'noopener noreferrer' }, 'Google: avaliações e fotos'),
+      h.instagram
+        ? el('a', { class: 'btn', href: h.instagram, target: '_blank', rel: 'noopener noreferrer' }, 'Instagram')
+        : el('button', { class: 'btn quiet', type: 'button', onclick: () => houseDialog(h) }, '+ Adicionar Instagram'),
+      el('button', { class: 'icon', type: 'button', title: 'Editar casa', 'aria-label': `Editar ${h.name}`, onclick: () => houseDialog(h) }, '⋯')
+    )
+  );
 }
 
 function marketImportButton(primary) {
@@ -2208,7 +2238,7 @@ function marketRow(anchor, axis, houseCount) {
     return el(
       'button',
       {
-        class: `mk-dot${h.is_ref ? ' mk-ref' : ''}${p.q === 'A' ? '' : ' weak'}`,
+        class: `mk-dot${marketUi.highlight.has(h.id) ? ' mk-ref' : ''}${p.q === 'A' ? '' : ' weak'}`,
         type: 'button',
         'aria-label': `${h.name}: R$ ${reais(p.cents)}`,
         style: { left: pct(p.cents), bottom: `${3 + Math.min(level, 5) * 11}px` },
@@ -2356,11 +2386,11 @@ function marketDetail() {
       node: el(
         'li',
         null,
-        el('span', { class: `mk-mark${h.is_ref ? ' mk-ref' : ''}${p.q === 'A' ? '' : ' weak'}`, 'aria-hidden': 'true' }),
+        el('span', { class: `mk-mark${marketUi.highlight.has(h.id) ? ' mk-ref' : ''}${p.q === 'A' ? '' : ' weak'}`, 'aria-hidden': 'true' }),
         el(
           'div',
           null,
-          el('button', { class: `mk-house${h.is_ref ? ' mk-ref' : ''}`, type: 'button', title: 'Ajustar tipo e referência', onclick: () => houseDialog(h) }, h.name),
+          el('button', { class: `mk-house${marketUi.highlight.has(h.id) ? ' mk-ref' : ''}`, type: 'button', title: 'Ajustar tipo e referência', onclick: () => houseDialog(h) }, h.name),
           el('span', { class: 'hint' }, p.label),
           el(
             'span',
@@ -2388,7 +2418,7 @@ function marketDetail() {
     el('h2', null, anchor),
     el('p', { class: 'hint' }, prices.length ? `${prices.length} casas · de R$ ${reais(prices[0])} a R$ ${reais(prices[prices.length - 1])} · mediana R$ ${reais(quantile(prices, 0.5))}` : 'Nenhuma casa neste filtro.'),
     el('ul', null, rows.map((r) => r.node)),
-    el('p', { class: 'hint' }, 'Preço lido de foto de cardápio, não confirmado no local. Volumes e porções variam: o texto abaixo do nome é o item como está escrito no cardápio. Clique no nome da casa para ajustar o tipo ou marcá-la como referência.')
+    el('p', { class: 'hint' }, 'Preço lido de foto de cardápio, não confirmado no local. Volumes e porções variam: o texto abaixo do nome é o item como está escrito no cardápio. Clique no nome da casa para ajustar o tipo, o Instagram ou marcá-la como referência.')
   );
 }
 
@@ -2408,6 +2438,10 @@ function marketView() {
       )
     );
   }
+  // Casas em destaque (azul): começam pelas marcadas como referência; clicar no badge liga e desliga.
+  if (!marketUi.highlight) marketUi.highlight = new Set(market.houses.filter((h) => h.is_ref).map((h) => h.id));
+  for (const id of [...marketUi.highlight]) if (!marketHouse(id)) marketUi.highlight.delete(id);
+  if (marketUi.focus && !marketHouse(marketUi.focus)) marketUi.focus = null;
   const anchors = market.sections.flatMap((sec) => sec.items);
   if (!anchors.includes(marketUi.selected)) marketUi.selected = anchors.find((a) => (market.points[a] || []).length) || anchors[0];
   const houseCount = market.houses.filter((h) => marketUi.tipo === 'todas' || h.tipo === marketUi.tipo).length;
@@ -2487,12 +2521,44 @@ function marketView() {
       'div',
       { class: 'mk-legend', 'aria-label': 'Legenda' },
       legend('mk-mark', 'casa'),
-      legend('mk-mark mk-ref', 'referência nossa'),
+      legend('mk-mark mk-ref', 'casa em destaque'),
       legend('mk-mark weak', 'foto antiga ou leitura incerta'),
       legend('mk-key-band', 'metade central'),
       legend('mk-key-median', 'mediana'),
       legend('mk-key-ours', 'nosso preço')
     ),
+    el(
+      'div',
+      { class: 'mk-houses', role: 'group', 'aria-label': 'Casas monitoradas' },
+      market.houses
+        .filter((h) => marketUi.tipo === 'todas' || h.tipo === marketUi.tipo)
+        .map((h) => {
+          const on = marketUi.highlight.has(h.id);
+          return el(
+            'button',
+            {
+              class: `mk-badge${on ? ' on' : ''}${marketUi.focus === h.id ? ' focus' : ''}`,
+              type: 'button',
+              'aria-pressed': String(on),
+              title: on ? 'Tirar do destaque' : 'Destacar no gráfico',
+              onclick: () => {
+                // Clicar destaca e mostra a ficha; clicar de novo na casa da ficha tira o destaque.
+                if (on && marketUi.focus === h.id) {
+                  marketUi.highlight.delete(h.id);
+                  marketUi.focus = null;
+                } else {
+                  marketUi.highlight.add(h.id);
+                  marketUi.focus = h.id;
+                }
+                render();
+              },
+            },
+            el('span', { class: 'mk-badge-dot', 'aria-hidden': 'true' }),
+            h.name
+          );
+        })
+    ),
+    marketUi.focus && marketHouseCard(marketHouse(marketUi.focus)),
     el(
       'div',
       { class: 'mk-body' },

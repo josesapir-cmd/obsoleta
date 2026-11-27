@@ -562,6 +562,11 @@ test('cardápio: importa planilha, reconhece itens comparáveis e guarda o rascu
 
   // ajustar e remover casa
   assert.equal((await ana('PATCH', `/market/houses/${um}`, { tipo: 'outro' })).status, 400);
+  assert.equal((await ana('PATCH', `/market/houses/${um}`, { instagram: 'https://evil.example/x' })).status, 400);
+  await ana('PATCH', `/market/houses/${um}`, { instagram: '@casa.um' });
+  assert.equal((await ana('GET', '/market')).body.houses.find((h) => h.id === um).instagram, 'https://www.instagram.com/casa.um/');
+  await ana('PATCH', `/market/houses/${um}`, { instagram: 'https://www.instagram.com/casaum_rj/?hl=pt' });
+  assert.equal((await ana('GET', '/market')).body.houses.find((h) => h.id === um).instagram, 'https://www.instagram.com/casaum_rj/');
   await ana('PATCH', `/market/houses/${um}`, { tipo: 'brunch', is_ref: true });
   await ana('DELETE', `/market/houses/${dois}`);
   m = (await ana('GET', '/market')).body;
