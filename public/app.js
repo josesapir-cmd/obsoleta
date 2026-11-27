@@ -9,7 +9,7 @@ let me = null;
 let state = null;
 let stateJson = '';
 let people = null; // lista completa, só para admin
-let view = { '#referencias': 'refs', '#arquivos': 'files', '#conta': 'ledger', '#cardapio': 'market' }[location.hash] || 'tasks';
+let view = { '#referencias': 'refs', '#arquivos': 'files', '#conta': 'ledger', '#cardapio': 'market', '#catalogo': 'books' }[location.hash] || 'tasks';
 let market = null; // dados da aba Cardápio, carregados só quando ela é aberta
 const marketUi = { tipo: 'todas', onlyA: true, selected: null, highlight: null, focus: null };
 let showSettled = false;
@@ -1125,6 +1125,10 @@ function openActivityTarget(a) {
   }
   if (a.kind === 'files' || a.kind === 'folders') return go('files', '#arquivos');
   if (a.kind === 'expenses') return go('ledger', '#conta');
+  if (a.kind === 'books') {
+    go('books', '#catalogo');
+    return a.target_id ? bookDialog(a.target_id) : undefined;
+  }
   if (a.kind === 'market') {
     go('market', '#cardapio');
     return refresh(true);
@@ -2593,6 +2597,309 @@ function marketView() {
   );
 }
 
+// ---------- catálogo de livros ----------
+
+let books = null; // última resposta do servidor (totais e opções de filtro)
+let bookItems = []; // livros já carregados para os filtros atuais
+let bookSeq = 0;
+let bookTimer;
+let bookGrid = null;
+let bookCount = null;
+const bookUi = { q: '', selo: '', genero: '', disp: '', picked: '', sort: 'recentes' };
+
+function bookQuery(extra) {
+  const [grupo, selo] = bookUi.selo.split('|');
+  const params = { q: bookUi.q, grupo, selo, genero: bookUi.genero, disponibilidade: bookUi.disp, picked: bookUi.picked, sort: bookUi.sort, ...extra };
+  return Object.entries(params)
+    .filter(([, v]) => v !== '' && v != null)
+    .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
+    .join('&');
+}
+
+// reset = filtros mudaram (recomeça do início); senão, busca a página seguinte.
+async function loadBooks(reset) {
+  const mine = ++bookSeq;
+  try {
+    const res = await api('GET', `/books?${bookQuery({ offset: reset ? 0 : bookItems.length })}`);
+    if (mine !== bookSeq) return; // já há uma busca mais nova a caminho
+    const first = !books;
+    books = res;
+    bookItems = reset ? res.items : [...bookItems, ...res.items];
+    if (first || !bookGrid || !document.contains(bookGrid)) render();
+    else drawBooks();
+  } catch (e) {
+    if (me) toast(e.message);
+  }
+}
+
+function bookCover(b, large) {
+  const blank = () => el('span', { class: 'book-blank' }, b.titulo);
+  if (!b.capa_url) return blank();
+  return el('img', { src: b.capa_url, alt: large ? `Capa de ${b.titulo}` : '', loading: 'lazy', referrerPolicy: 'no-referrer', onerror: (e) => e.currentTarget.replaceWith(blank()) });
+}
+
+async function togglePick(b) {
+  try {
+    const { on } = await api('POST', `/books/${b.id}/pick`, {});
+    b.picks = on ? [...b.picks, me.id] : b.picks.filter((id) => id !== me.id);
+    const item = bookItems.find((x) => x.id === b.id);
+    if (item) item.picks = b.picks;
+    if (books) books.picked += on && b.picks.length === 1 ? 1 : !on && b.picks.length === 0 ? -1 : 0;
+  } catch (e) {
+    toast(e.message);
+  }
+  drawBooks();
+}
+
+function pickButton(b, withLabel) {
+  const mine = b.picks.includes(me.id);
+  const names = b.picks.map((id) => (userById(id) || {}).name).filter(Boolean).join(', ');
+  return el(
+    'button',
+    {
+      class: `book-pick${mine ? ' on' : ''}${b.picks.length ? ' some' : ''}`,
+      type: 'button',
+      'aria-pressed': String(mine),
+      'aria-label': mine ? `Tirar ${b.titulo} da minha seleção` : `Selecionar ${b.titulo}`,
+      title: names ? `Selecionado por ${names}` : 'Selecionar para o acervo',
+      onclick: () => togglePick(b),
+    },
+    mine ? '★' : '☆',
+    b.picks.length > 0 && el('span', null, String(b.picks.length)),
+    withLabel && el('span', null, mine ? 'Na minha seleção' : 'Selecionar')
+  );
+}
+
+function bookCard(b) {
+  const out = b.disponibilidade && b.disponibilidade !== 'Disponível';
+  return el(
+    'li',
+    { class: `book${out ? ' out' : ''}` },
+    el(
+      'button',
+      { class: 'book-open', type: 'button', onclick: () => bookDialog(b.id) },
+      el('span', { class: 'book-cover' }, bookCover(b), out && el('span', { class: 'tag' }, b.disponibilidade)),
+      el('strong', null, b.titulo),
+      el('span', { class: 'hint' }, b.autores || '—'),
+      el('span', { class: 'hint' }, [b.selo, b.ano_publicacao].filter(Boolean).join(' · ')),
+      b.preco_cents && el('span', { class: 'book-price' }, `R$ ${reais(b.preco_cents)}`)
+    ),
+    pickButton(b)
+  );
+}
+
+function drawBooks() {
+  if (!bookGrid || !books) return;
+  if (bookCount) bookCount.textContent = `${books.total.toLocaleString('pt-BR')} ${books.total === 1 ? 'livro' : 'livros'}${books.total < books.catalog ? ` de ${books.catalog.toLocaleString('pt-BR')}` : ''} · ${books.picked} selecionado(s)`;
+  const rest = books.total - bookItems.length;
+  bookGrid.replaceChildren(
+    bookItems.length ? el('ul', { class: 'books' }, bookItems.map(bookCard)) : el('p', { class: 'hint empty' }, 'Nenhum livro com esses filtros.'),
+    rest > 0 && el('div', { class: 'book-more' }, el('button', { class: 'btn', type: 'button', onclick: () => loadBooks(false) }, `Carregar mais (${rest.toLocaleString('pt-BR')} restantes)`))
+  );
+}
+
+async function bookDialog(id) {
+  let b;
+  try {
+    b = await api('GET', `/books/${id}`);
+  } catch (e) {
+    return toast(e.message);
+  }
+  const row = (label, value) => value && el('div', { class: 'book-fact' }, el('dt', null, label), el('dd', null, value));
+  const rating = (site, nota, n, extra) =>
+    (nota || n) && el('div', { class: 'balance' }, el('span', { class: 'hint' }, site), el('strong', null, nota || '—'), el('span', { class: 'hint' }, [n && `${Number(n).toLocaleString('pt-BR')} avaliações`, extra].filter(Boolean).join(' · ')));
+  const ratings = [
+    rating('Amazon', b.amazon_nota, b.amazon_avaliacoes, b.amazon_ranking && `ranking ${b.amazon_ranking}`),
+    rating('Goodreads', b.goodreads_nota, b.goodreads_avaliacoes, b.goodreads_resenhas && `${b.goodreads_resenhas} resenhas`),
+    rating('Skoob', b.skoob_nota, b.skoob_avaliacoes, b.skoob_leram && `${b.skoob_leram} leram`),
+  ].filter(Boolean);
+  const pickSlot = el('span', null, pickButton(b, true));
+  const dlg = el(
+    'dialog',
+    { class: 'modal item book-modal' },
+    el(
+      'header',
+      { class: 'item-head' },
+      el('div', null, el('h2', null, b.titulo), b.subtitulo && el('p', { class: 'hint' }, b.subtitulo), el('p', null, b.autores)),
+      el('button', { class: 'icon', type: 'button', 'aria-label': 'Fechar', title: 'Fechar', onclick: () => dlg.close() }, '✕')
+    ),
+    el(
+      'div',
+      { class: 'book-detail' },
+      el('div', { class: 'book-side' }, el('span', { class: 'book-cover' }, bookCover(b, true)), pickSlot, b.url && el('a', { class: 'btn', href: b.url, target: '_blank', rel: 'noopener noreferrer' }, 'Página na editora'), b.link_amazon && el('a', { class: 'btn', href: b.link_amazon, target: '_blank', rel: 'noopener noreferrer' }, 'Ver na Amazon')),
+      el(
+        'div',
+        { class: 'book-main' },
+        el(
+          'dl',
+          { class: 'book-facts' },
+          row('Editora', b.selo === b.grupo ? b.selo : `${b.selo} (${b.grupo})`),
+          row('Lançamento', b.data_lancamento ? b.data_lancamento.split('-').reverse().join('/') : b.ano_publicacao),
+          row('Edição', [b.edicao_numero && `${b.edicao_numero}ª`, b.edicao_obs].filter(Boolean).join(' · ')),
+          row('Preço de capa', b.preco_cents && `R$ ${reais(b.preco_cents)}`),
+          row('Situação', b.disponibilidade),
+          row('Formato', [b.formato, b.paginas && `${b.paginas} páginas`, b.dimensoes].filter(Boolean).join(' · ')),
+          row('Gênero', [b.genero, b.classificacao].filter(Boolean).join(' · ')),
+          row('Série', b.serie),
+          row('Título original', b.titulo_original),
+          row('Tradução', b.tradutor),
+          row('Origem do autor', b.origem_autor),
+          row('Prêmios', b.premios),
+          row('Tiragem', b.tiragem),
+          row('ISBN', [b.isbn, b.isbn_ebook && `e-book ${b.isbn_ebook}`, b.isbn_audiolivro && `audiolivro ${b.isbn_audiolivro}`].filter(Boolean).join(' · '))
+        ),
+        ratings.length > 0 && el('div', { class: 'book-ratings' }, ratings),
+        ratings.length > 0 && b.data_consulta && el('p', { class: 'hint' }, `Notas consultadas em ${b.data_consulta.split('-').reverse().join('/')}.`),
+        b.sinopse && el('h3', null, 'Sinopse'),
+        b.sinopse && el('p', { class: 'rich' }, b.sinopse),
+        b.sobre_autor && el('h3', null, 'Sobre o autor'),
+        b.sobre_autor && el('p', { class: 'rich' }, b.sobre_autor),
+        b.temas && el('p', { class: 'hint' }, `Temas: ${b.temas}`)
+      )
+    )
+  );
+  // Selecionar dentro da janela atualiza o botão aqui e o cartão na grade.
+  pickSlot.addEventListener('click', () => setTimeout(() => pickSlot.replaceChildren(pickButton(b, true)), 400));
+  dlg.addEventListener('close', () => dlg.remove());
+  document.body.append(dlg);
+  dlg.showModal();
+}
+
+// Lista dos selecionados no formato que o prompt de notas (Amazon, Goodreads, Skoob) espera.
+async function exportPicks() {
+  try {
+    const res = await api('GET', '/books?picked=todos&limit=2000&sort=autor');
+    if (!res.items.length) return toast('Ninguém selecionou livros ainda.');
+    const cell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const rows = [['isbn', 'titulo', 'autores', 'selo', 'link_amazon', 'selecionado_por'], ...res.items.map((b) => [b.isbn, b.titulo, b.autores, b.selo, b.link_amazon, b.picks.map((id) => (userById(id) || {}).name).filter(Boolean).join(', ')])];
+    const a = el('a', { href: URL.createObjectURL(new Blob([`\ufeff${rows.map((r) => r.map(cell).join(';')).join('\r\n')}`], { type: 'text/csv;charset=utf-8' })), download: `livros-selecionados-${today()}.csv` });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
+function bookImportButton(primary) {
+  const picker = el('input', {
+    type: 'file',
+    accept: '.csv,text/csv',
+    hidden: true,
+    onchange: async () => {
+      const file = picker.files[0];
+      picker.value = '';
+      if (!file) return;
+      toast('Importando catálogo… pode levar alguns segundos.');
+      try {
+        const res = await fetch('/api/books/import', { method: 'POST', headers: { 'Content-Type': 'text/csv', 'X-Requested-With': 'obsoleta' }, body: file });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || 'Não foi possível importar a planilha.');
+        toast(`Importado: ${data.added} novos, ${data.updated} atualizados${data.skipped ? `, ${data.skipped} linhas ignoradas` : ''}.`);
+      } catch (e) {
+        toast(e.message);
+      }
+      books = null;
+      loadBooks(true);
+    },
+  });
+  return el('span', null, picker, el('button', { class: `btn${primary ? ' primary' : ''}`, type: 'button', onclick: () => picker.click() }, 'Importar planilha'));
+}
+
+function booksView() {
+  if (!books) {
+    if (!bookSeq) loadBooks(true);
+    return el('main', { class: 'catalog' }, el('p', { class: 'hint empty' }, 'Carregando…'));
+  }
+  if (!books.catalog) {
+    return el(
+      'main',
+      { class: 'catalog' },
+      el('div', { class: 'mk-head' }, el('div', null, el('h1', null, 'Catálogo'), el('p', { class: 'hint' }, 'Os livros das editoras, para montar a seleção do acervo.'))),
+      el(
+        'div',
+        { class: 'backup' },
+        el('h2', null, 'Ainda não há catálogo importado'),
+        el('p', { class: 'hint' }, me.is_admin ? 'Importe o arquivo catalogo_editoras.csv. Depois, planilhas parciais (só ISBN e notas, ou o catálogo de outra editora) podem ser importadas por cima: cada livro é casado pelo ISBN.' : 'Peça a um admin para importar a planilha do catálogo.'),
+        me.is_admin && bookImportButton(true)
+      )
+    );
+  }
+  const reload = () => loadBooks(true);
+  const select = (key, label, options) => {
+    const node = el(
+      'select',
+      {
+        'aria-label': label,
+        onchange: () => {
+          bookUi[key] = node.value;
+          reload();
+        },
+      },
+      options
+    );
+    return node;
+  };
+  const opt = (value, label) => el('option', { value, selected: value === undefined ? false : null }, label);
+  const pick = (key, value, label) => el('option', { value, selected: bookUi[key] === value }, label);
+  const groups = [...new Set(books.selos.map((x) => x.grupo))];
+  const search = el('input', {
+    id: 'book-q',
+    type: 'search',
+    value: bookUi.q,
+    placeholder: 'Buscar por título, autor, tema, ISBN…',
+    'aria-label': 'Buscar no catálogo',
+    autocomplete: 'off',
+    oninput: () => {
+      bookUi.q = search.value;
+      clearTimeout(bookTimer);
+      bookTimer = setTimeout(reload, 250);
+    },
+  });
+  bookGrid = el('div', { class: 'book-grid' });
+  bookCount = el('span', { id: 'book-count', class: 'hint', 'aria-live': 'polite' });
+  const view = el(
+    'main',
+    { class: 'catalog' },
+    el('div', { class: 'mk-head' }, el('div', null, el('h1', null, 'Catálogo'), el('p', { class: 'hint' }, 'Os livros das editoras, para montar a seleção do acervo. A estrela marca um livro como candidato; todos veem quem marcou.'))),
+    el(
+      'div',
+      { class: 'toolbar book-filters' },
+      search,
+      select('selo', 'Editora ou selo', [
+        pick('selo', '', 'Todas as editoras'),
+        ...groups.map((g) => {
+          const selos = books.selos.filter((x) => x.grupo === g);
+          return el('optgroup', { label: g }, selos.length > 1 && pick('selo', `${g}|`, `Todo o grupo (${selos.reduce((n, x) => n + x.n, 0).toLocaleString('pt-BR')})`), selos.map((x) => pick('selo', `${g}|${x.selo}`, `${x.selo} (${x.n.toLocaleString('pt-BR')})`)));
+        }),
+      ]),
+      select('genero', 'Gênero', [pick('genero', '', 'Todos os gêneros'), ...books.generos.map((x) => pick('genero', x.name, `${x.name} (${x.n.toLocaleString('pt-BR')})`))]),
+      select('disp', 'Situação', [pick('disp', '', 'Qualquer situação'), ...['Disponível', 'Pré Venda', 'Sob Demanda', 'Esgotado'].map((d) => pick('disp', d, d))]),
+      select('picked', 'Seleção', [pick('picked', '', 'Todos os livros'), pick('picked', 'todos', 'Selecionados por alguém'), pick('picked', 'meus', 'Minha seleção')]),
+      select('sort', 'Ordem', [
+        pick('sort', 'recentes', 'Mais recentes'),
+        pick('sort', 'antigos', 'Mais antigos'),
+        pick('sort', 'titulo', 'Título'),
+        pick('sort', 'autor', 'Autor'),
+        pick('sort', 'preco_menor', 'Menor preço'),
+        pick('sort', 'preco_maior', 'Maior preço'),
+      ])
+    ),
+    el(
+      'div',
+      { class: 'toolbar book-bar' },
+      bookCount,
+      el('span', { class: 'spacer' }),
+      el('button', { class: 'btn', type: 'button', onclick: exportPicks }, 'Exportar selecionados'),
+      me.is_admin && bookImportButton(false)
+    ),
+    bookGrid
+  );
+  drawBooks();
+  return view;
+}
+
 // ---------- pessoas ----------
 
 function personDialog(u) {
@@ -2999,6 +3306,7 @@ function render() {
   const scrollLeft = boardScroll ? boardScroll.scrollLeft : 0;
   // Se a pessoa está digitando uma nova tarefa, o texto sobrevive ao redesenho da tela.
   const typed = document.activeElement;
+  const searching = typed && typed.id === 'book-q' ? { at: typed.selectionStart } : null;
   const draft =
     typed && typed.classList.contains('quick') && root.contains(typed)
       ? { cat: typed.closest('.column').dataset.cat, value: typed.value, at: typed.selectionStart }
@@ -3026,7 +3334,7 @@ function render() {
       'header',
       { class: 'top' },
       el('span', { class: 'brand' }, 'Obsoleta'),
-      el('nav', null, tab('tasks', 'Tarefas', '#tarefas'), tab('refs', 'Referências', '#referencias'), tab('files', 'Arquivos', '#arquivos'), tab('ledger', 'Conta corrente', '#conta'), tab('market', 'Cardápio', '#cardapio'), me.is_admin && tab('people', 'Pessoas', '#pessoas')),
+      el('nav', null, tab('tasks', 'Tarefas', '#tarefas'), tab('refs', 'Referências', '#referencias'), tab('files', 'Arquivos', '#arquivos'), tab('ledger', 'Conta corrente', '#conta'), tab('market', 'Cardápio', '#cardapio'), tab('books', 'Catálogo', '#catalogo'), me.is_admin && tab('people', 'Pessoas', '#pessoas')),
       el('span', { class: 'spacer' }),
       el(
         'button',
@@ -3068,7 +3376,7 @@ function render() {
         'Sair'
       )
     ),
-    view === 'refs' ? refsView() : view === 'files' ? filesView() : view === 'ledger' ? ledgerView() : view === 'market' ? marketView() : view === 'people' ? peopleView() : tasksView()
+    view === 'refs' ? refsView() : view === 'files' ? filesView() : view === 'ledger' ? ledgerView() : view === 'market' ? marketView() : view === 'books' ? booksView() : view === 'people' ? peopleView() : tasksView()
   );
 
   const board = root.querySelector('.board');
@@ -3080,6 +3388,12 @@ function render() {
     const q = root.querySelector(`.column[data-cat="${focusCat}"] .quick`);
     if (q) q.focus();
     focusCat = null;
+  } else if (searching && !document.querySelector('dialog[open]')) {
+    const box = document.getElementById('book-q');
+    if (box) {
+      box.focus();
+      box.setSelectionRange(searching.at, searching.at);
+    }
   } else if (draft && !document.querySelector('dialog[open]')) {
     const q = root.querySelector(`.column[data-cat="${draft.cat}"] .quick`);
     if (q) {

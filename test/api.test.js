@@ -574,3 +574,59 @@ test('cardápio: importa planilha, reconhece itens comparáveis e guarda o rascu
   assert.deepEqual(m.points.Espresso.map((p) => p.cents), [1000]);
   assert.equal((await fetch(`${base}/market`)).status, 401);
 });
+
+test('catálogo de livros: importa, busca, filtra, seleciona e recebe notas depois', async () => {
+  const ana = client(); // admin
+  await ana('POST', '/login', { email: 'ana@example.com', password: cookieOf.password });
+  const dora = client();
+  await dora('POST', '/login', { email: 'dora@example.com', password: 'senha-da-dora-123' });
+  const line = (...cells) => cells.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(';');
+  const head = ['grupo', 'selo', 'titulo', 'autores', 'isbn', 'ano_publicacao', 'data_lancamento', 'genero', 'preco', 'disponibilidade', 'sinopse', 'capa_url', 'url', 'amazon_nota'];
+  const csv = [
+    line(...head),
+    line('Companhia das Letras', 'Alfaguara', 'Cidades da planície', 'Cormac McCarthy', '9788556522023', '2024', '2024-02-27', 'Literatura Estrangeira', '92,90', 'Disponível', 'Faroeste; com "aspas"', 'https://cdn.example.com/a.jpg', 'https://www.example.com/a', ''),
+    line('Companhia das Letras', 'Companhia das Letras', 'Capitães da areia', 'Jorge Amado', '978-85-359-1169-5', '2008', '2008-03-10', 'Literatura Brasileira', '79,90', 'Esgotado', 'Meninos de Salvador', 'http://inseguro.example/x.jpg', 'https://www.example.com/b', ''),
+    line('Intrínseca', 'Intrínseca', 'O mundo depois de nós', 'Rumaan Alam', '9786555606393', '2023', '2023-11-03', 'Ficção Literária; Thriller', '69,90', 'Disponível', '', '', 'https://www.example.com/c', ''),
+    line('Fósforo', 'Fósforo', 'Sem identificação', 'Alguém', '', '', '', '', '', '', '', '', '', ''),
+  ].join('\r\n');
+  const send = (who, body) => fetch(`${base}/books/import`, { method: 'POST', headers: { 'X-Requested-With': 'obsoleta', 'Content-Type': 'text/csv', cookie: who.cookie() }, body });
+  assert.equal((await send(dora, csv)).status, 403);
+  assert.equal((await send(ana, 'a;b\n1;2')).status, 400);
+  assert.deepEqual(await (await send(ana, csv)).json(), { added: 3, updated: 0, skipped: 1 });
+  assert.deepEqual(await (await send(ana, csv)).json(), { added: 0, updated: 0, skipped: 1 });
+
+  const list = async (qs) => (await dora('GET', `/books?${qs}`)).body;
+  let r = await list('');
+  assert.equal(r.total, 3);
+  assert.deepEqual(r.items.map((b) => b.titulo), ['Cidades da planície', 'O mundo depois de nós', 'Capitães da areia']); // mais recentes primeiro
+  assert.equal(r.items[2].capa_url, ''); // capa sem https é descartada
+  assert.equal(r.items[2].isbn, '9788535911695');
+  assert.deepEqual((await list('q=capitaes+AMADO')).items.map((b) => b.titulo), ['Capitães da areia']);
+  assert.equal((await list('q=planicie+amado')).total, 0);
+  assert.equal((await list('selo=Alfaguara')).total, 1);
+  assert.equal((await list('grupo=' + encodeURIComponent('Companhia das Letras') + '&disponibilidade=' + encodeURIComponent('Disponível'))).total, 1);
+  assert.deepEqual((await list('genero=Thriller')).items.map((b) => b.titulo), ['O mundo depois de nós']);
+  assert.deepEqual((await list('sort=preco_menor')).items.map((b) => b.preco_cents), [6990, 7990, 9290]);
+  assert.deepEqual(r.selos.map((x) => [x.selo, x.n]), [['Alfaguara', 1], ['Companhia das Letras', 1], ['Intrínseca', 1]]);
+  assert.ok(r.generos.some((x) => x.name === 'Thriller' && x.n === 1));
+
+  // seleção por pessoa
+  const id = r.items[0].id;
+  assert.deepEqual((await dora('POST', `/books/${id}/pick`, {})).body, { on: true });
+  await ana('POST', `/books/${id}/pick`, {});
+  assert.equal((await list('picked=meus')).total, 1);
+  assert.equal((await list('picked=todos')).items[0].picks.length, 2);
+  assert.deepEqual((await dora('POST', `/books/${id}/pick`, {})).body, { on: false });
+  assert.equal((await list('picked=meus')).total, 0);
+  assert.equal((await list('picked=todos')).total, 1);
+
+  // planilha parcial de notas: atualiza só o que traz, ignora livro desconhecido
+  const notas = [line('isbn', 'amazon_nota', 'amazon_avaliacoes', 'goodreads_nota'), line('9788556522023', '4,6', '1280', '4,1'), line('9780000000000', '5,0', '3', '')].join('\n');
+  assert.deepEqual(await (await send(ana, notas)).json(), { added: 0, updated: 1, skipped: 1 });
+  const book = (await dora('GET', `/books/${id}`)).body;
+  assert.equal(book.amazon_nota, '4,6');
+  assert.equal(book.goodreads_nota, '4,1');
+  assert.equal(book.sinopse, 'Faroeste; com "aspas"'); // o resto ficou intacto
+  assert.equal(book.busca, undefined);
+  assert.equal((await fetch(`${base}/books`)).status, 401);
+});

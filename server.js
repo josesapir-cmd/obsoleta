@@ -221,6 +221,18 @@ function anchorOf(item, variation, category) {
   return '';
 }
 
+// Colunas de texto do catálogo de livros, com o tamanho máximo de cada uma. São as mesmas da
+// planilha de coleta; as de notas (Amazon, Goodreads, Skoob) chegam depois, em planilhas parciais.
+const BOOK_COLS = {
+  grupo: 80, selo: 80, titulo: 300, subtitulo: 300, autores: 300, origem_autor: 200, titulo_original: 300, tradutor: 200, isbn: 13,
+  ano_publicacao: 4, data_lancamento: 10, edicao_numero: 4, edicao_obs: 120, edicoes_no_catalogo: 4, formato: 60, paginas: 6, dimensoes: 60,
+  genero: 200, classificacao: 200, temas: 600, serie: 200, premios: 400, preco: 12, disponibilidade: 40, sinopse: 2000, sobre_autor: 1500,
+  capa_url: 600, url: 600, isbn_ebook: 13, isbn_audiolivro: 13, link_amazon: 600, amazon_nota: 6, amazon_avaliacoes: 10, amazon_ranking: 60,
+  amazon_preco: 12, goodreads_nota: 6, goodreads_avaliacoes: 10, goodreads_resenhas: 10, skoob_nota: 6, skoob_avaliacoes: 10, skoob_leram: 10,
+  skoob_querem_ler: 10, data_consulta: 10, tiragem: 20,
+};
+const BOOK_URL_COLS = ['capa_url', 'url', 'link_amazon'];
+
 function fileName(v) {
   let s;
   try {
@@ -402,6 +414,12 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       updated_by INTEGER REFERENCES users(id),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+    CREATE TABLE IF NOT EXISTS book_picks (
+      book_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (book_id, user_id)
+    );
     CREATE TABLE IF NOT EXISTS passkeys (
       id INTEGER PRIMARY KEY,
       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -449,6 +467,16 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       PRIMARY KEY (comment_id, user_id)
     );
   `);
+
+  // Catálogo de livros: uma linha por edição (ISBN). "chave" é o ISBN ou, na falta dele, o endereço da página.
+  db.exec(
+    `CREATE TABLE IF NOT EXISTS books (
+       id INTEGER PRIMARY KEY, chave TEXT NOT NULL UNIQUE, busca TEXT NOT NULL DEFAULT '', preco_cents INTEGER,
+       ${Object.keys(BOOK_COLS).map((c) => `${c} TEXT NOT NULL DEFAULT ''`).join(', ')}
+     );
+     CREATE INDEX IF NOT EXISTS books_selo ON books (grupo, selo);
+     CREATE INDEX IF NOT EXISTS books_data ON books (data_lancamento);`
+  );
 
   // Migração: Instagram das casas da pesquisa de cardápios.
   if (!db.prepare('PRAGMA table_info(market_houses)').all().some((c) => c.name === 'instagram')) {
@@ -1621,6 +1649,148 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       log(req, 'removeu da pesquisa de cardápios', 'market', null, h.name);
     }
     res.json({ ok: true });
+  });
+
+  // ---------- catálogo de livros ----------
+
+  // Importa a planilha do catálogo. Cada linha é casada pelo ISBN: livro novo é incluído, livro
+  // existente recebe só as colunas que vierem preenchidas. Assim uma planilha parcial (só ISBN e
+  // notas, por exemplo) atualiza o que tem, sem apagar o resto.
+  api.post('/books/import', adminOnly, async (req, res) => {
+    if (Number(req.get('Content-Length')) > 80 * 1024 * 1024) throw new HttpError(413, 'Planilha grande demais (máximo de 80 MB).');
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (size > 80 * 1024 * 1024) throw new HttpError(413, 'Planilha grande demais (máximo de 80 MB).');
+      chunks.push(chunk);
+    }
+    const rows = parseCsv(Buffer.concat(chunks).toString('utf8'));
+    if (rows.length < 2) bad('Planilha vazia ou em formato não reconhecido.');
+    const header = rows[0].map((h) => foldText(h));
+    if (!header.includes('isbn') && !header.includes('url')) bad('A planilha precisa ter a coluna "isbn" (ou "url"). Use o arquivo do catálogo, separado por ponto e vírgula.');
+    const present = Object.keys(BOOK_COLS).filter((c) => header.includes(c));
+    const at = Object.fromEntries(present.map((c) => [c, header.indexOf(c)]));
+    const find = q('SELECT * FROM books WHERE chave = ?');
+    const insert = q(`INSERT INTO books (chave, busca, preco_cents, ${present.join(', ')}) VALUES (?, ?, ?, ${present.map(() => '?').join(', ')})`);
+    let added = 0;
+    let updated = 0;
+    let skipped = 0;
+    tx(() => {
+      for (const row of rows.slice(1)) {
+        const v = {};
+        for (const c of present) {
+          let value = String(row[at[c]] || '').trim();
+          if (c.startsWith('isbn')) value = /^\d{13}$/.test(value.replace(/\D/g, '')) ? value.replace(/\D/g, '') : '';
+          value = value.slice(0, BOOK_COLS[c]);
+          if (BOOK_URL_COLS.includes(c) && !/^https:\/\//i.test(value)) value = '';
+          v[c] = value;
+        }
+        const key = v.isbn || v.url;
+        if (!key) {
+          skipped += 1;
+          continue;
+        }
+        const cur = find.get(key);
+        const merged = { ...(cur || {}) };
+        for (const c of present) if (v[c]) merged[c] = v[c];
+        if (!merged.titulo) {
+          skipped += 1; // linha de notas para um livro que não está no catálogo
+          continue;
+        }
+        const busca = foldText([merged.titulo, merged.subtitulo, merged.autores, merged.titulo_original, merged.selo, merged.temas, merged.serie, merged.isbn].join(' '));
+        const m = /^(\d+)(?:[.,](\d{1,2}))?$/.exec(merged.preco || '');
+        const preco = m ? Number(m[1]) * 100 + Number((m[2] || '0').padEnd(2, '0')) : null;
+        if (cur) {
+          const changed = present.filter((c) => v[c] && v[c] !== cur[c]);
+          if (changed.length) {
+            q(`UPDATE books SET busca = ?, preco_cents = ?, ${changed.map((c) => `${c} = ?`).join(', ')} WHERE id = ?`).run(busca, preco, ...changed.map((c) => v[c]), cur.id);
+            updated += 1;
+          }
+        } else {
+          insert.run(key, busca, preco, ...present.map((c) => v[c]));
+          added += 1;
+        }
+      }
+      log(req, 'importou o catálogo de livros', 'books', null, `${added} novos`, `${updated} atualizados`);
+    });
+    res.json({ added, updated, skipped });
+  });
+
+  const BOOK_SORT = {
+    recentes: "data_lancamento = '', data_lancamento DESC, ano_publicacao DESC, titulo COLLATE NOCASE",
+    antigos: "ano_publicacao = '', ano_publicacao, data_lancamento, titulo COLLATE NOCASE",
+    titulo: 'titulo COLLATE NOCASE',
+    autor: "autores = '', autores COLLATE NOCASE, titulo COLLATE NOCASE",
+    preco_menor: 'preco_cents IS NULL, preco_cents, titulo COLLATE NOCASE',
+    preco_maior: 'preco_cents IS NULL, preco_cents DESC, titulo COLLATE NOCASE',
+  };
+  const BOOK_CARD = 'id, titulo, subtitulo, autores, grupo, selo, ano_publicacao, preco_cents, disponibilidade, capa_url, isbn, link_amazon';
+
+  api.get('/books', (req, res) => {
+    const g = (k) => (typeof req.query[k] === 'string' ? req.query[k].slice(0, 120) : '');
+    const where = [];
+    const args = [];
+    for (const term of foldText(g('q')).split(/\s+/).filter(Boolean).slice(0, 8)) {
+      where.push("busca LIKE ? ESCAPE '\\'");
+      args.push(`%${term.replace(/[\\%_]/g, '\\$&')}%`);
+    }
+    for (const col of ['grupo', 'selo', 'disponibilidade']) {
+      if (g(col)) {
+        where.push(`${col} = ?`);
+        args.push(g(col));
+      }
+    }
+    if (g('genero')) {
+      where.push("('; ' || genero || '; ') LIKE ?");
+      args.push(`%; ${g('genero')}; %`);
+    }
+    if (g('picked') === 'todos') where.push('id IN (SELECT book_id FROM book_picks)');
+    if (g('picked') === 'meus') {
+      where.push('id IN (SELECT book_id FROM book_picks WHERE user_id = ?)');
+      args.push(req.user.id);
+    }
+    const cond = where.length ? `WHERE ${where.join(' AND ')}` : '';
+    const limit = Math.min(Math.max(parseInt(g('limit'), 10) || 48, 1), 2000);
+    const offset = Math.max(parseInt(g('offset'), 10) || 0, 0);
+    const items = q(`SELECT ${BOOK_CARD} FROM books ${cond} ORDER BY ${BOOK_SORT[g('sort')] || BOOK_SORT.recentes} LIMIT ? OFFSET ?`).all(...args, limit, offset);
+    const picks = new Map();
+    for (const r of q('SELECT book_id, user_id FROM book_picks ORDER BY created_at').all()) {
+      if (!picks.has(r.book_id)) picks.set(r.book_id, []);
+      picks.get(r.book_id).push(r.user_id);
+    }
+    const generos = new Map();
+    for (const r of q("SELECT genero, COUNT(*) AS n FROM books WHERE genero <> '' GROUP BY genero").all()) {
+      for (const name of r.genero.split('; ')) generos.set(name, (generos.get(name) || 0) + r.n);
+    }
+    res.json({
+      total: q(`SELECT COUNT(*) AS n FROM books ${cond}`).get(...args).n,
+      catalog: q('SELECT COUNT(*) AS n FROM books').get().n,
+      picked: picks.size,
+      items: items.map((b) => ({ ...b, picks: picks.get(b.id) || [] })),
+      selos: q('SELECT grupo, selo, COUNT(*) AS n FROM books GROUP BY grupo, selo ORDER BY grupo, n DESC').all(),
+      generos: [...generos].map(([name, n]) => ({ name, n })).sort((a, b) => b.n - a.n).slice(0, 60),
+    });
+  });
+
+  api.get('/books/:id', (req, res) => {
+    const b = q('SELECT * FROM books WHERE id = ?').get(intId(req.params.id));
+    if (!b) throw new HttpError(404, 'Livro não encontrado.');
+    delete b.busca;
+    delete b.chave;
+    res.json({ ...b, picks: q('SELECT user_id FROM book_picks WHERE book_id = ? ORDER BY created_at').all(b.id).map((r) => r.user_id) });
+  });
+
+  // Liga ou desliga a seleção da própria pessoa para um livro.
+  api.post('/books/:id/pick', (req, res) => {
+    const b = q('SELECT id, titulo, autores FROM books WHERE id = ?').get(intId(req.params.id));
+    if (!b) throw new HttpError(404, 'Livro não encontrado.');
+    const removed = q('DELETE FROM book_picks WHERE book_id = ? AND user_id = ?').run(b.id, req.user.id).changes;
+    if (!removed) {
+      q('INSERT INTO book_picks (book_id, user_id) VALUES (?, ?)').run(b.id, req.user.id);
+      log(req, 'selecionou o livro', 'books', b.id, b.titulo, b.autores);
+    }
+    res.json({ on: !removed });
   });
 
   // ---------- backup (admin) ----------

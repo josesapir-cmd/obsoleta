@@ -681,6 +681,47 @@ main.market { --mk-dot: #8a8277; --mk-ref: #257de0; --mk-soft: #e6dece; --mk-gri
 .mk-house.mk-ref { font-weight: 600; }
 main.market > .backup { margin-top: 16px; }
 
+/* ---------- catálogo de livros ---------- */
+
+main.catalog { width: 100%; max-width: 1500px; margin: 0 auto; }
+.book-filters input[type='search'] { flex: 1 1 260px; min-width: 0; }
+.book-filters select { flex: 0 1 auto; max-width: 240px; }
+.book-bar { padding-top: 10px; }
+.book-grid { padding: 12px 16px 32px; }
+.books { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 18px 14px; }
+.book { position: relative; min-width: 0; }
+.book-open { width: 100%; display: flex; flex-direction: column; gap: 2px; border: 0; background: none; padding: 0; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
+.book-open strong { font-size: 14px; line-height: 1.25; margin-top: 6px; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }
+.book-open .hint { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.book-open:hover strong { text-decoration: underline; }
+.book-cover { position: relative; display: grid; place-items: center; aspect-ratio: 2 / 3; background: var(--surface); border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+.book-cover img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.book-cover .tag { position: absolute; left: 6px; bottom: 6px; background: var(--card); }
+.book.out .book-cover img { opacity: 0.55; }
+.book-blank { padding: 12px; font-family: var(--serif); font-size: 14px; text-align: center; color: var(--muted); overflow-wrap: anywhere; }
+.book-price { font-size: 13px; font-variant-numeric: tabular-nums; }
+.book-pick { display: inline-flex; align-items: center; gap: 4px; min-height: 30px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); background: var(--card); color: var(--muted); cursor: pointer; font-size: 15px; }
+.book-pick span { font-size: 12px; }
+.book > .book-pick { position: absolute; top: 6px; right: 6px; box-shadow: var(--shadow); }
+.book-pick:hover { border-color: var(--muted); color: var(--ink); }
+.book-pick.some { color: var(--ink); }
+.book-pick.on { border-color: var(--accent); background: var(--accent); color: var(--accent-ink); }
+.book-more { display: flex; justify-content: center; padding-top: 24px; }
+
+.modal.book-modal { width: min(920px, calc(100vw - 32px)); }
+.book-modal .item-head > div { flex: 1; min-width: 0; }
+.book-detail { display: flex; flex-wrap: wrap; gap: 20px; overflow-y: auto; min-height: 0; }
+.book-side { flex: 0 0 220px; max-width: 100%; display: flex; flex-direction: column; gap: 8px; align-items: stretch; }
+.book-side .btn { text-align: center; }
+.book-side .book-pick { justify-content: center; min-height: 36px; }
+.book-main { flex: 1 1 380px; min-width: 0; display: flex; flex-direction: column; gap: 10px; }
+.book-facts { margin: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px 16px; }
+.book-fact { min-width: 0; overflow-wrap: anywhere; }
+.book-fact dt { font-size: 12px; color: var(--muted); }
+.book-fact dd { margin: 0; font-size: 14px; }
+.book-ratings { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+.book-main .rich { white-space: normal; }
+
 /* ---------- pessoas ---------- */
 
 main.people { max-width: 680px; }
