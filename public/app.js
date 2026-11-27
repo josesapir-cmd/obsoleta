@@ -131,7 +131,13 @@ function formDialog({ title, fields, submit = 'Salvar', onSubmit, onDelete, dele
   const getters = {};
   const picked = [];
   let addFiles = null;
+  let showFiles = () => {};
   const err = el('p', { class: 'form-error', role: 'alert' });
+  // Linha de andamento ("Enviando recibo.jpg (40%)"), visível dentro da janela enquanto salva.
+  const status = el('p', { class: 'form-status', role: 'status', hidden: true }, el('span', { class: 'spinner', 'aria-hidden': 'true' }), el('span'));
+  const setStatus = (text) => {
+    status.lastChild.textContent = text;
+  };
 
   const rows = fields.map((f) => {
     const id = `f-${f.name}`;
@@ -262,6 +268,7 @@ function formDialog({ title, fields, submit = 'Salvar', onSubmit, onDelete, dele
         picked.push(...(f.any ? [...list] : imagesOnly(list)));
         show();
       };
+      showFiles = show;
       input = el('input', { id, type: 'file', accept: f.any ? null : IMAGE_TYPES, multiple: true, onchange: () => { addFiles(input.files); input.value = ''; } });
       getters[f.name] = () => picked;
       return el('div', { class: 'field' }, el('label', { for: id }, f.label), input, info);
@@ -296,19 +303,26 @@ function formDialog({ title, fields, submit = 'Salvar', onSubmit, onDelete, dele
           e.preventDefault();
           err.textContent = '';
           saveBtn.disabled = true;
+          saveBtn.textContent = 'Salvando…';
+          setStatus('Salvando…');
+          status.hidden = false;
           try {
             const values = {};
             for (const k of Object.keys(getters)) values[k] = getters[k]();
-            await onSubmit(values);
+            await onSubmit(values, setStatus);
             dlg.close();
           } catch (ex) {
             err.textContent = ex.message;
             saveBtn.disabled = false;
+            saveBtn.textContent = submit;
+            status.hidden = true;
+            showFiles(); // arquivos que não subiram continuam na fila para a próxima tentativa
           }
         },
       },
       el('h2', null, title),
       rows,
+      status,
       err,
       el(
         'div',
@@ -379,11 +393,15 @@ async function shrink(file) {
   }
 }
 
-async function uploadImages(refId, files) {
+// Envia as imagens da fila, tirando cada uma só depois que subiu: se uma falhar, as que
+// faltam continuam na fila e uma nova tentativa retoma de onde parou.
+async function uploadImages(refId, files, say = toast) {
   let n = 0;
-  for (const f of files) {
+  const total = files.length;
+  while (files.length) {
+    const f = files[0];
     n += 1;
-    toast(`Enviando imagem ${n} de ${files.length}…`);
+    say(`Enviando imagem ${n} de ${total}…`);
     const blob = await shrink(f);
     const res = await fetch(`/api/refs/${refId}/images`, {
       method: 'POST',
@@ -394,6 +412,7 @@ async function uploadImages(refId, files) {
       const data = await res.json().catch(() => ({}));
       throw new Error(data.error || 'Não foi possível enviar a imagem.');
     }
+    files.shift();
   }
   if (n) toast(n === 1 ? 'Imagem enviada.' : `${n} imagens enviadas.`);
 }
@@ -1563,11 +1582,15 @@ function refDialog(ref) {
       { name: 'theme_id', label: 'Tema', type: 'select', numeric: true, value: ref.theme_id, options: state.themes.map((t) => [t.id, t.name]) },
       { name: 'files', label: 'Anexar imagens', type: 'files', hint: 'Escolha arquivos ou arraste imagens para esta janela.' },
     ],
-    onSubmit: async ({ files, ...v }) => {
+    onSubmit: async ({ files, ...v }, say) => {
       const id = ref.id || (await api('POST', '/refs', v)).id;
       if (ref.id) await api('PATCH', `/refs/${id}`, v);
       ref.id = id; // se o envio de imagem falhar, salvar de novo não duplica a referência
-      await uploadImages(id, files.splice(0));
+      try {
+        await uploadImages(id, files, say);
+      } catch (ex) {
+        throw new Error(`A referência foi salva, mas ${files.length} imagem(ns) não subiram: ${ex.message} Clique em Salvar para tentar de novo.`);
+      }
     },
     onDelete: ref.id ? () => api('DELETE', `/refs/${ref.id}`) : null,
     deleteLabel: 'Excluir referência',
@@ -1777,7 +1800,9 @@ function uploadFile(url, file, onProgress) {
       } catch {}
       reject(new Error(msg));
     };
-    xhr.onerror = () => reject(new Error('O envio falhou. Verifique a conexão e tente de novo.'));
+    xhr.onerror = () => reject(new Error('A conexão caiu durante o envio.'));
+    xhr.ontimeout = () => reject(new Error('O envio demorou demais e foi interrompido.'));
+    xhr.timeout = 5 * 60 * 1000;
     xhr.send(file);
   });
 }
@@ -1938,14 +1963,23 @@ function expenseDialog(e) {
       { name: 'files', label: 'Comprovantes', type: 'files', any: true, hint: 'Nota, recibo, comprovante de pagamento. Escolha arquivos ou arraste para esta janela.' },
       e && me.is_admin && { name: 'settled', label: 'Já acertado', type: 'checkbox', value: !!e.settled_at },
     ].filter(Boolean),
-    onSubmit: async ({ files, amount, ...v }) => {
+    onSubmit: async ({ files, amount, ...v }, say) => {
       v.amount_cents = parseMoney(amount);
       const id = e ? e.id : (await api('POST', '/expenses', v)).id;
       if (e) await api('PATCH', `/expenses/${id}`, v);
       e = e || { id }; // se o anexo falhar, salvar de novo não duplica o lançamento
-      for (const f of files.splice(0)) {
-        if (f.size > MAX_FILE_BYTES) throw new Error(`"${f.name}" passa do limite de 50 MB.`);
-        await uploadFile(`/expenses/${id}/files`, f, (frac) => toast(`Enviando ${f.name} (${Math.round(frac * 100)}%)`));
+      // Cada arquivo só sai da fila depois que subiu; se um falhar, salvar de novo retoma daqui.
+      while (files.length) {
+        const f = files[0];
+        try {
+          if (f.size > MAX_FILE_BYTES) throw new Error(`"${f.name}" passa do limite de 50 MB.`);
+          if (!f.size) throw new Error(`"${f.name}" está vazio ou não pôde ser lido do aparelho.`);
+          say(`Enviando ${f.name}…`);
+          await uploadFile(`/expenses/${id}/files`, f, (frac) => say(`Enviando ${f.name} (${Math.round(frac * 100)}%)`));
+        } catch (ex) {
+          throw new Error(`O gasto foi salvo, mas o anexo não subiu: ${ex.message} Clique em Salvar para tentar de novo.`);
+        }
+        files.shift();
       }
     },
     onDelete: e ? () => api('DELETE', `/expenses/${e.id}`) : null,

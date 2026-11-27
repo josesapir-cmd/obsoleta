@@ -1296,6 +1296,8 @@ function createApp({ dbPath, uploadDir, filesDir, production = false, admin, pre
       if (!size) bad('Arquivo vazio.');
     } catch (e) {
       fs.rm(full, { force: true }, () => {});
+      // Fica no log do servidor para diagnosticar envios que falham (rede, limite, disco).
+      console.warn(`Envio de arquivo falhou em ${req.originalUrl}: "${name}", ${size} de ${req.get('Content-Length') || '?'} bytes — ${e.message}`);
       throw e.status ? e : new HttpError(400, 'O envio foi interrompido. Tente de novo.');
     }
     return { name, stored, size };
